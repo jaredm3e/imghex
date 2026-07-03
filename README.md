@@ -11,6 +11,20 @@ It understands **BMP** and **Netpbm (PPM/PGM)**, and the architecture is
 format-agnostic: adding a new format is one trait implementation plus one line
 in the registry.
 
+## Screenshots
+
+![Section-colored hex view of a small BMP, with the inspector decoding the selected byte in context](.github/screenshots/demo1.png)
+
+*Section-colored view: every byte is tinted by the region it belongs to (file
+header, info header, palette, pixel data — see the legend), and the inspector
+decodes the selected byte in context — here the `BM` magic number.*
+
+![Pixel-color mode on a photo BMP, showing the statistics panel, palette grid, and whole-file entropy strip](.github/screenshots/demo2.png)
+
+*Pixel-color mode on a real photo: bytes painted by their decoded color, a
+multi-byte selection with Shannon entropy and a byte histogram, the full palette
+grid, and the whole-file entropy strip across the top.*
+
 ## Features
 
 - **Structure-colored hex grid** — every byte tinted by its region; a legend
