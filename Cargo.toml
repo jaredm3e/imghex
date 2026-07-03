@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["imghex-core", "imghex-gui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["imghex contributors"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"

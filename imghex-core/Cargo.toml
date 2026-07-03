@@ -1,0 +1,11 @@
+[package]
+name = "imghex-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Format-aware model for a hex editor of image files (BMP and beyond)."
+
+[dependencies]
+
+[dev-dependencies]
