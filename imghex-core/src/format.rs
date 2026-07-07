@@ -53,6 +53,7 @@ pub fn registry() -> Vec<Box<dyn ImageFormat>> {
     vec![
         Box::new(crate::formats::bmp::BmpFormat),
         Box::new(crate::formats::netpbm::NetpbmFormat),
+        Box::new(crate::formats::jpeg::JpegFormat),
     ]
 }
 

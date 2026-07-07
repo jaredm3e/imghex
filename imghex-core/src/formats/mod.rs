@@ -4,4 +4,5 @@
 //! [`crate::format::registry`].
 
 pub mod bmp;
+pub mod jpeg;
 pub mod netpbm;

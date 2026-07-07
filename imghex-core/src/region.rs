@@ -20,7 +20,14 @@ pub enum RegionKind {
     ColorMasks,
     /// A color palette / color table (indexed color).
     Palette,
-    /// The raw pixel / sample data.
+    /// Application/metadata segments carrying no pixel data (e.g. JPEG APPn,
+    /// EXIF, comments).
+    Metadata,
+    /// Coding tables that parameterize compression (e.g. JPEG quantization and
+    /// Huffman tables).
+    Table,
+    /// The raw pixel / sample data. For compressed formats this is the
+    /// entropy-coded stream rather than directly addressable samples.
     PixelData,
     /// Bytes that are part of the file but not attributed to any structure
     /// (padding between sections, trailing data).
@@ -38,6 +45,8 @@ impl RegionKind {
             RegionKind::InfoHeader => "Info header",
             RegionKind::ColorMasks => "Color masks",
             RegionKind::Palette => "Palette",
+            RegionKind::Metadata => "Metadata",
+            RegionKind::Table => "Coding tables",
             RegionKind::PixelData => "Pixel data",
             RegionKind::Gap => "Gap / padding",
             RegionKind::Unknown => "Unknown",
@@ -53,6 +62,8 @@ impl RegionKind {
             RegionKind::InfoHeader => Rgba::rgb(0x7C, 0xA7, 0xC0), // blue
             RegionKind::ColorMasks => Rgba::rgb(0xC0, 0xA7, 0x7C), // tan
             RegionKind::Palette => Rgba::rgb(0xC0, 0x7C, 0xB8),    // magenta
+            RegionKind::Metadata => Rgba::rgb(0xB0, 0x8C, 0xC8),   // violet
+            RegionKind::Table => Rgba::rgb(0x6C, 0xC0, 0xB4),      // teal
             RegionKind::PixelData => Rgba::rgb(0xC0, 0xB0, 0x60),  // gold
             RegionKind::Gap => Rgba::rgb(0x88, 0x88, 0x88),        // gray
             RegionKind::Unknown => Rgba::rgb(0x66, 0x66, 0x66),    // dark gray
