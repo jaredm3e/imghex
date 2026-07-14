@@ -480,6 +480,11 @@ impl eframe::App for HexApp {
                         self.load_bytes("demo-24bpp.bmp".into(), fixtures::demo_24bpp());
                         ui.close_menu();
                     }
+                    ui.separator();
+                    if ui.button("JPEG marker structure").clicked() {
+                        self.load_bytes("demo.jpg".into(), fixtures::demo_jpeg());
+                        ui.close_menu();
+                    }
                 });
                 ui.separator();
                 ui.label("Color:");

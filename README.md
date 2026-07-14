@@ -7,9 +7,11 @@ selected byte in context** — for example, selecting a byte in the pixel data o
 an indexed (paletted) image tells you the pixel coordinate, the palette index,
 and resolves the actual color from the palette.
 
-It understands **BMP** and **Netpbm (PPM/PGM)**, and the architecture is
-format-agnostic: adding a new format is one trait implementation plus one line
-in the registry.
+It understands **BMP**, **Netpbm (PPM/PGM)**, and **JPEG (JFIF)**, and the
+architecture is format-agnostic: adding a new format is one trait implementation
+plus one line in the registry. (JPEG's pixels are DCT-compressed rather than
+byte-addressable, so imghex maps its marker structure — SOI/APPn/DQT/DHT/SOF/SOS
+— and decodes the frame header, instead of resolving individual pixel bytes.)
 
 ## Screenshots
 
@@ -65,11 +67,12 @@ imghex-core/   # pure logic, no GUI deps — the tested core
     formats/
       bmp.rs     the BMP parser
       netpbm.rs  the PPM/PGM parser (second format — proves modularity)
+      jpeg.rs    the JPEG/JFIF marker-structure parser
     stats.rs     ByteStats + block entropy for the stats panel / entropy strip
     search.rs    byte-pattern search + hex query parsing
     fixtures.rs  image builders used by tests and the demo images
   tests/
-    bmp_tests.rs, netpbm_tests.rs   integration tests over the public API
+    bmp_tests.rs, netpbm_tests.rs, jpeg_tests.rs   integration tests over the public API
 
 imghex-gui/    # egui/eframe frontend; renders whatever the core produces
   src/main.rs

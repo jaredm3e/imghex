@@ -246,3 +246,69 @@ pub fn demo_24bpp() -> Vec<u8> {
     }
     bgr_24bpp(w, h, &pixels)
 }
+
+/// Append a length-prefixed JPEG marker segment (`FF <marker> <len:2> payload`).
+/// The big-endian length counts the two length bytes plus the payload.
+fn push_jpeg_segment(out: &mut Vec<u8>, marker: u8, payload: &[u8]) {
+    out.push(0xFF);
+    out.push(marker);
+    let len = (payload.len() + 2) as u16;
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(payload);
+}
+
+/// Build a structurally valid baseline JPEG (JFIF) byte stream.
+///
+/// The image is not meant to be *decoded* — imghex reads JPEG marker structure,
+/// not its DCT-compressed pixels — so the quantization/Huffman tables and the
+/// entropy-coded scan data hold placeholder bytes. What is faithful is the
+/// framing: SOI, an APP0/JFIF segment, a comment, a DQT, a baseline SOF0 that
+/// carries the real `width`/`height`, a DHT, an SOS, some scan data (including a
+/// stuffed `FF00` and an `FFD0` restart marker, to exercise the scan walker),
+/// and EOI.
+pub fn jpeg_baseline(width: u16, height: u16) -> Vec<u8> {
+    let mut out = Vec::new();
+    // SOI
+    out.extend_from_slice(&[0xFF, 0xD8]);
+    // APP0 / JFIF: identifier, version 1.01, no density, no thumbnail.
+    push_jpeg_segment(
+        &mut out,
+        0xE0,
+        &[
+            b'J', b'F', b'I', b'F', 0x00, // "JFIF\0"
+            0x01, 0x01, // version 1.01
+            0x00, // density units: none
+            0x00, 0x01, 0x00, 0x01, // X/Y density 1×1
+            0x00, 0x00, // thumbnail 0×0
+        ],
+    );
+    // Comment
+    push_jpeg_segment(&mut out, 0xFE, b"imghex demo");
+    // DQT: table id 0, 8-bit precision, 64 placeholder quantization values.
+    let mut dqt = vec![0x00];
+    dqt.extend(std::iter::repeat_n(0x10, 64));
+    push_jpeg_segment(&mut out, 0xDB, &dqt);
+    // SOF0 (baseline DCT): precision 8, dimensions, one grayscale component.
+    let mut sof = vec![0x08];
+    sof.extend_from_slice(&height.to_be_bytes());
+    sof.extend_from_slice(&width.to_be_bytes());
+    sof.push(0x01); // component count
+    sof.extend_from_slice(&[0x01, 0x11, 0x00]); // id, sampling factors, quant table
+    push_jpeg_segment(&mut out, 0xC0, &sof);
+    // DHT: class 0, id 0, an all-zero counts table (no symbols) — placeholder.
+    let mut dht = vec![0x00];
+    dht.extend(std::iter::repeat_n(0x00, 16));
+    push_jpeg_segment(&mut out, 0xC4, &dht);
+    // SOS: one component.
+    push_jpeg_segment(&mut out, 0xDA, &[0x01, 0x01, 0x00, 0x00, 0x3F, 0x00]);
+    // Entropy-coded data: an ordinary byte, a stuffed FF00, and an FFD0 restart.
+    out.extend_from_slice(&[0xAA, 0xBB, 0xFF, 0x00, 0xCC, 0xFF, 0xD0, 0x12, 0x34]);
+    // EOI
+    out.extend_from_slice(&[0xFF, 0xD9]);
+    out
+}
+
+/// A 16×16 baseline JPEG demo, exercising the marker-structure view.
+pub fn demo_jpeg() -> Vec<u8> {
+    jpeg_baseline(16, 16)
+}
