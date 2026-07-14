@@ -312,3 +312,25 @@ pub fn jpeg_baseline(width: u16, height: u16) -> Vec<u8> {
 pub fn demo_jpeg() -> Vec<u8> {
     jpeg_baseline(16, 16)
 }
+
+/// Build a minimal JPEG (SOI, one DQT, EOI) whose single DQT segment defines
+/// two quantization tables: table 0 with 8-bit values `0..64`, and table 1 with
+/// 16-bit values `1000..1064` — exercising multi-table and 16-bit DQT decoding.
+pub fn jpeg_dual_dqt() -> Vec<u8> {
+    let mut dqt = Vec::new();
+    // Table 0: Pq = 0 (8-bit values), Tq = 0.
+    dqt.push(0x00);
+    for k in 0..64u16 {
+        dqt.push(k as u8);
+    }
+    // Table 1: Pq = 1 (16-bit values), Tq = 1.
+    dqt.push(0x11);
+    for k in 0..64u16 {
+        dqt.extend_from_slice(&(1000 + k).to_be_bytes());
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(&[0xFF, 0xD8]); // SOI
+    push_jpeg_segment(&mut out, 0xDB, &dqt);
+    out.extend_from_slice(&[0xFF, 0xD9]); // EOI
+    out
+}

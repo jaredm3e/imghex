@@ -112,6 +112,93 @@ fn regions_are_sorted_and_non_overlapping() {
 }
 
 #[test]
+fn dqt_header_and_coefficients_are_decoded() {
+    let jpg = fixtures::jpeg_baseline(16, 16);
+    let img = parse_auto(&jpg).unwrap();
+
+    // The baseline fixture's DQT holds one 8-bit table (id 0) of 64 values, all
+    // 0x10 = 16. The precision/id byte becomes its own field...
+    let header = img
+        .fields
+        .iter()
+        .find(|f| f.name == "quant_table")
+        .expect("quant table header field");
+    assert_eq!(header.value, "table 0, 8-bit");
+    assert_eq!(header.len(), 1);
+
+    // ...and each of the 64 coefficients is a separate field.
+    let coeffs: Vec<_> = img
+        .fields
+        .iter()
+        .filter(|f| f.name.starts_with("q["))
+        .collect();
+    assert_eq!(coeffs.len(), 64);
+
+    // The first coefficient (zig-zag position 0) maps to natural index (0,0) and
+    // sits immediately after the header byte, with the fixture's value of 16.
+    let dc = img.fields.iter().find(|f| f.name == "q[0][0]").unwrap();
+    assert_eq!(dc.value, "16");
+    assert_eq!(dc.start, header.end);
+    assert_eq!(dc.len(), 1);
+
+    // Zig-zag position 2 maps to natural index 8, i.e. row 1, col 0.
+    assert!(img.fields.iter().any(|f| f.name == "q[1][0]"));
+
+    // Summary reports the table count.
+    assert!(img
+        .summary
+        .iter()
+        .any(|(k, v)| k == "Quantization tables" && v == "1"));
+}
+
+#[test]
+fn dqt_decodes_multiple_tables_and_16bit_precision() {
+    let jpg = fixtures::jpeg_dual_dqt();
+    let img = parse_auto(&jpg).unwrap();
+
+    // Two table headers, 128 coefficient fields (64 per table).
+    let headers: Vec<_> = img
+        .fields
+        .iter()
+        .filter(|f| f.name == "quant_table")
+        .collect();
+    assert_eq!(headers.len(), 2);
+    let coeffs: Vec<_> = img
+        .fields
+        .iter()
+        .filter(|f| f.name.starts_with("q["))
+        .collect();
+    assert_eq!(coeffs.len(), 128);
+
+    // Payload begins at offset 6 (SOI=2, FF DB + 2-byte length = 4). Table 0's
+    // 8-bit coefficients occupy offsets 7..71, so table 1's header is at 71.
+    let t0 = img
+        .fields
+        .iter()
+        .find(|f| f.start == 6 && f.name == "quant_table")
+        .unwrap();
+    assert_eq!(t0.value, "table 0, 8-bit");
+    let t1 = img
+        .fields
+        .iter()
+        .find(|f| f.start == 71 && f.name == "quant_table")
+        .unwrap();
+    assert_eq!(t1.value, "table 1, 16-bit");
+
+    // Table 1's first (16-bit) coefficient sits at offset 72, spans two bytes,
+    // and decodes the big-endian value 1000.
+    let t1_dc = img.fields.iter().find(|f| f.start == 72).unwrap();
+    assert_eq!(t1_dc.name, "q[0][0]");
+    assert_eq!(t1_dc.value, "1000");
+    assert_eq!(t1_dc.len(), 2);
+
+    assert!(img
+        .summary
+        .iter()
+        .any(|(k, v)| k == "Quantization tables" && v == "2"));
+}
+
+#[test]
 fn truncated_after_soi_does_not_panic() {
     // Just the SOI marker, nothing else.
     let img = parse_auto(&[0xFF, 0xD8]).unwrap();
