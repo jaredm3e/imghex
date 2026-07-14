@@ -29,6 +29,75 @@ fn u16be(b: &[u8], o: usize) -> u16 {
     u16::from_be_bytes([b[o], b[o + 1]])
 }
 
+/// The JPEG zig-zag scan order: for each of the 64 positions in the coefficient
+/// stream, the natural (row-major) index it occupies in the 8×8 block. A DQT
+/// stores its quantization values in this order, so element `k` of the stream
+/// scales the DCT coefficient at natural index `ZIGZAG[k]` (row `n / 8`, col
+/// `n % 8`).
+const ZIGZAG: [u8; 64] = [
+    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20,
+    13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59,
+    52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
+];
+
+/// Decode a DQT (Define Quantization Table) payload into fine-grained fields.
+///
+/// The payload holds one or more tables back to back. Each is a `Pq<<4 | Tq`
+/// header byte — high nibble `Pq` is the element precision (0 = 8-bit, 1 =
+/// 16-bit values), low nibble `Tq` is the table id (0–3) — followed by 64
+/// quantization values in zig-zag order (64 bytes for 8-bit, 128 for 16-bit).
+/// `base` is the file offset of the first payload byte. Returns the number of
+/// complete tables decoded (for the summary). A truncated trailing table is
+/// decoded as far as the payload allows and not counted.
+fn decode_dqt(payload: &[u8], base: usize, fields: &mut Vec<Field>) -> usize {
+    let mut i = 0usize;
+    let mut tables = 0usize;
+    while i < payload.len() {
+        let pq_tq = payload[i];
+        let precision = pq_tq >> 4; // 0 = 8-bit values, 1 = 16-bit values
+        let table_id = pq_tq & 0x0F;
+        let bytes_per = if precision == 0 { 1 } else { 2 };
+        let header_off = base + i;
+        fields.push(Field::new(
+            header_off,
+            header_off + 1,
+            "quant_table",
+            format!(
+                "table {table_id}, {}-bit",
+                if precision == 0 { 8 } else { 16 }
+            ),
+            "Quantization table header: high nibble is element precision (0 = 8-bit, 1 = 16-bit), low nibble is the table id (0–3).",
+        ));
+        i += 1;
+        // 64 quantization steps follow, stored in zig-zag scan order.
+        for (k, &n) in ZIGZAG.iter().enumerate() {
+            if i + bytes_per > payload.len() {
+                // Truncated table: stop without counting it.
+                return tables;
+            }
+            let start = base + i;
+            let value = if bytes_per == 1 {
+                payload[i] as u16
+            } else {
+                u16be(payload, i)
+            };
+            let (row, col) = (n / 8, n % 8);
+            fields.push(Field::new(
+                start,
+                start + bytes_per,
+                format!("q[{row}][{col}]"),
+                format!("{value}"),
+                format!(
+                    "Quantization step for the DCT coefficient at row {row}, col {col} (zig-zag position {k})."
+                ),
+            ));
+            i += bytes_per;
+        }
+        tables += 1;
+    }
+    tables
+}
+
 /// Does this marker stand alone (no length + payload)? SOI/EOI/TEM/RSTn do.
 fn is_standalone(marker: u8) -> bool {
     matches!(marker, 0xD8 | 0xD9 | 0x01) || (0xD0..=0xD7).contains(&marker)
@@ -142,6 +211,7 @@ impl ImageFormat for JpegFormat {
         let mut jfif_version: Option<String> = None;
         let mut has_exif = false;
         let mut comment: Option<String> = None;
+        let mut quant_tables = 0usize;
         let mut segment_count = 0usize;
 
         let mut pos = 0usize;
@@ -345,6 +415,8 @@ impl ImageFormat for JpegFormat {
                     format!("{ri}"),
                     "Number of MCUs between restart markers.",
                 ));
+            } else if marker == 0xDB {
+                quant_tables += decode_dqt(payload, payload_start, &mut fields);
             }
 
             if marker == 0xDA {
@@ -392,6 +464,9 @@ impl ImageFormat for JpegFormat {
                 _ => "",
             };
             summary.push(("Components".into(), format!("{components}{kind}")));
+        }
+        if quant_tables > 0 {
+            summary.push(("Quantization tables".into(), format!("{quant_tables}")));
         }
         if let Some(v) = jfif_version {
             summary.push(("JFIF version".into(), v));
