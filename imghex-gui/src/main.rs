@@ -41,6 +41,15 @@ enum SearchMode {
     Text,
 }
 
+/// Which hex-grid column typed characters edit. Set by clicking a cell.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EditPane {
+    /// Type two hex nibbles to overwrite the byte under the cursor.
+    Hex,
+    /// Type a printable ASCII character to overwrite the byte under the cursor.
+    Ascii,
+}
+
 /// Target number of entropy blocks across the whole-file strip.
 const ENTROPY_BLOCKS: usize = 512;
 
@@ -54,6 +63,10 @@ const CELL_SPACING: f32 = 4.0; // horizontal gap between cells
 const GROUP_GAP: f32 = 8.0; // extra gap between the two 8-byte halves
 const ASCII_GAP: f32 = 14.0; // gap between hex and ASCII columns
 const ASCII_CELL_W: f32 = 9.0; // one ASCII character cell
+
+// Cursor outline color for the column that keystrokes currently edit (the other
+// column's cursor stays white), so it's obvious where a typed byte will land.
+const EDIT_CURSOR: Color32 = Color32::from_rgb(0xFF, 0xC0, 0x4D);
 
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
@@ -79,6 +92,26 @@ fn to_color32(c: Rgba) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a)
 }
 
+/// Derive a display file name (the final path component) from a path.
+fn name_from_path(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// Overwrite the byte at `offset` with `value`, returning whether the buffer
+/// actually changed (false when the offset is out of range or already equal).
+/// A pure helper so the edit logic can be unit tested without any GUI state.
+fn overwrite_byte(bytes: &mut [u8], offset: usize, value: u8) -> bool {
+    match bytes.get_mut(offset) {
+        Some(slot) if *slot != value => {
+            *slot = value;
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Pick black or white text for legibility on top of `bg`.
 fn text_on(bg: Rgba) -> Color32 {
     if bg.luminance() > 140 {
@@ -98,6 +131,9 @@ enum DialogResult {
 
 struct HexApp {
     file_name: Option<String>,
+    /// Full path of the loaded file, if it came from disk; the target for a
+    /// plain Save. `None` for the demo and byte-only drops, which force Save As.
+    file_path: Option<std::path::PathBuf>,
     bytes: Vec<u8>,
     parsed: Option<Result<ParsedImage, ParseError>>,
     /// Incremented each time a new file is loaded; used to invalidate caches.
@@ -109,8 +145,27 @@ struct HexApp {
     color_mode: ColorMode,
     status: String,
     /// Receives the result of an in-flight native file dialog running on a
-    /// background thread. `Some` while a dialog is open.
+    /// background thread. `Some` while an Open dialog is open.
     open_rx: Option<std::sync::mpsc::Receiver<DialogResult>>,
+    /// As `open_rx`, but for a Save As dialog.
+    save_rx: Option<std::sync::mpsc::Receiver<DialogResult>>,
+
+    // Editing state.
+    /// Unsaved edits since the last load/save.
+    dirty: bool,
+    /// Which column typed characters overwrite (set by clicking a cell).
+    edit_pane: EditPane,
+    /// The first of two hex nibbles, typed but not yet committed. The hex cell
+    /// renders it as "N_" until the second digit lands.
+    pending_nibble: Option<u8>,
+    /// OS window title last pushed to the viewport (avoids resending each frame).
+    shown_title: String,
+    /// Showing the "unsaved changes" confirmation before quitting.
+    confirm_quit: bool,
+    /// A Save is in flight because the user chose "Save & quit"; close once done.
+    quit_after_save: bool,
+    /// Set once the user has confirmed quitting so the close guard stops firing.
+    force_quit: bool,
 
     /// Per-block entropy of the whole file, computed once per load.
     entropy_blocks: Vec<f64>,
@@ -137,6 +192,7 @@ impl HexApp {
     fn new() -> Self {
         let mut app = Self {
             file_name: None,
+            file_path: None,
             bytes: Vec::new(),
             parsed: None,
             generation: 0,
@@ -145,6 +201,14 @@ impl HexApp {
             color_mode: ColorMode::Sections,
             status: "Open a BMP file, drop one onto the window, or load the demo.".into(),
             open_rx: None,
+            save_rx: None,
+            dirty: false,
+            edit_pane: EditPane::Hex,
+            pending_nibble: None,
+            shown_title: String::new(),
+            confirm_quit: false,
+            quit_after_save: false,
+            force_quit: false,
             entropy_blocks: Vec::new(),
             entropy_block_size: 1,
             scroll_to_offset: None,
@@ -164,22 +228,107 @@ impl HexApp {
     }
 
     fn load_bytes(&mut self, name: String, bytes: Vec<u8>) {
-        self.status = format!("Loaded {} ({} bytes).", name, bytes.len());
-        self.parsed = Some(parse_auto(&bytes));
+        self.bytes = bytes;
+        self.reparse();
+        self.status = format!("Loaded {} ({} bytes).", name, self.bytes.len());
         if let Some(Err(e)) = &self.parsed {
             self.status = format!("{name}: could not parse — {e}");
         }
         self.file_name = Some(name);
-        self.bytes = bytes;
+        self.file_path = None;
         let init = if self.bytes.is_empty() { None } else { Some(0) };
         self.anchor = init;
         self.cursor = init;
+        self.dirty = false;
+        self.pending_nibble = None;
+        self.edit_pane = EditPane::Hex;
+    }
 
-        // Invalidate the preview cache and precompute the entropy strip.
+    /// Re-derive every piece of state that depends on `self.bytes`: the parsed
+    /// model, the preview-cache key, and the entropy strip. Shared by the initial
+    /// load and by each committed edit — because the parsers are pure functions,
+    /// re-running `parse_auto` after a mutation keeps regions, fields, the preview
+    /// and the entropy strip live with no incremental-parse machinery.
+    fn reparse(&mut self) {
+        self.parsed = Some(parse_auto(&self.bytes));
+        // Invalidate the preview cache and recompute the entropy strip.
         self.generation = self.generation.wrapping_add(1);
         self.preview_key = None;
         self.entropy_block_size = self.bytes.len().div_ceil(ENTROPY_BLOCKS).max(1);
         self.entropy_blocks = block_entropies(&self.bytes, self.entropy_block_size);
+    }
+
+    /// Apply text typed this frame as overwrite edits at the cursor, routed to
+    /// the hex or ASCII column per `edit_pane`. Same-length edits, so all offsets
+    /// stay valid and only a reparse is needed.
+    fn handle_edit_input(&mut self, ctx: &egui::Context) {
+        if self.cursor.is_none() {
+            return;
+        }
+        let events = ctx.input(|i| i.events.clone());
+        for event in events {
+            if let egui::Event::Text(text) = event {
+                for ch in text.chars() {
+                    match self.edit_pane {
+                        EditPane::Hex => self.type_hex_nibble(ch),
+                        EditPane::Ascii => self.type_ascii_char(ch),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handle one typed character in the hex column. The first hex digit is held
+    /// as the high nibble; the second commits the full byte.
+    fn type_hex_nibble(&mut self, ch: char) {
+        let Some(cursor) = self.cursor else { return };
+        let Some(nibble) = ch.to_digit(16) else {
+            return;
+        };
+        let nibble = nibble as u8;
+        match self.pending_nibble.take() {
+            None => {
+                self.pending_nibble = Some(nibble);
+                self.status = format!("0x{cursor:08X}: type the second hex digit…");
+            }
+            Some(high) => {
+                self.commit_overwrite(cursor, (high << 4) | nibble);
+                self.advance_cursor();
+            }
+        }
+    }
+
+    /// Handle one typed character in the ASCII column: overwrite with any
+    /// printable ASCII byte (the same range the ASCII column renders as text).
+    fn type_ascii_char(&mut self, ch: char) {
+        let Some(cursor) = self.cursor else { return };
+        let code = ch as u32;
+        if !ch.is_ascii() || !(0x20..0x7f).contains(&code) {
+            return;
+        }
+        self.commit_overwrite(cursor, code as u8);
+        self.advance_cursor();
+    }
+
+    /// Write `value` at `offset` and re-derive the model. Marks the buffer dirty
+    /// only when the byte actually changed.
+    fn commit_overwrite(&mut self, offset: usize, value: u8) {
+        self.pending_nibble = None;
+        if !overwrite_byte(&mut self.bytes, offset, value) {
+            return; // out of range or already equal — nothing to reparse
+        }
+        self.dirty = true;
+        self.reparse();
+        self.status = format!("Set 0x{offset:08X} = 0x{value:02X}.");
+    }
+
+    /// Move the cursor one byte forward after an edit (clamped to the last byte),
+    /// collapsing any selection so the next keystroke targets the new byte.
+    fn advance_cursor(&mut self) {
+        if let Some(c) = self.cursor {
+            let next = (c + 1).min(self.bytes.len().saturating_sub(1));
+            self.select_single(next);
+        }
     }
 
     /// Select a single byte and scroll the hex view to it.
@@ -304,13 +453,112 @@ impl HexApp {
     fn load_path(&mut self, path: &std::path::Path) {
         match std::fs::read(path) {
             Ok(bytes) => {
-                let name = path
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.display().to_string());
-                self.load_bytes(name, bytes);
+                self.load_bytes(name_from_path(path), bytes);
+                // `load_bytes` clears the path (demo/drop cases); restore the real
+                // one so a plain Save can write straight back here.
+                self.file_path = Some(path.to_path_buf());
             }
             Err(e) => self.status = format!("Failed to read {}: {e}", path.display()),
+        }
+    }
+
+    /// Save to the current file path, or fall back to Save As when there isn't
+    /// one yet (the demo buffer and byte-only drops have no path).
+    fn save(&mut self, ctx: &egui::Context) {
+        match self.file_path.clone() {
+            Some(path) => self.write_to(&path, ctx),
+            None => self.save_as_dialog(),
+        }
+    }
+
+    /// Open a native "save file" dialog on a background thread (same COM/threading
+    /// rationale as `open_dialog`).
+    fn save_as_dialog(&mut self) {
+        if self.save_rx.is_some() {
+            return; // a dialog is already open
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.save_rx = Some(rx);
+        self.status = "Choose where to save…".into();
+        let start_name = self
+            .file_name
+            .clone()
+            .unwrap_or_else(|| "untitled.bin".into());
+        std::thread::spawn(move || {
+            let picked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                rfd::FileDialog::new()
+                    .add_filter("Images (*.bmp)", &["bmp"])
+                    .add_filter("All files", &["*"])
+                    .set_title("Save image as")
+                    .set_file_name(start_name)
+                    .save_file()
+            }));
+            let result = match picked {
+                Ok(Some(path)) => DialogResult::Picked(path),
+                Ok(None) => DialogResult::Cancelled,
+                Err(payload) => {
+                    let msg = payload
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".to_string());
+                    DialogResult::Failed(msg)
+                }
+            };
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Poll the background save dialog, if one is open, and write on success.
+    fn poll_save_dialog(&mut self, ctx: &egui::Context) {
+        let result = match &self.save_rx {
+            Some(rx) => match rx.try_recv() {
+                Ok(result) => result,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint();
+                    return;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    DialogResult::Failed("dialog thread ended unexpectedly".into())
+                }
+            },
+            None => return,
+        };
+        self.save_rx = None;
+        match result {
+            DialogResult::Picked(path) => self.write_to(&path, ctx),
+            DialogResult::Cancelled => {
+                self.quit_after_save = false;
+                self.status = "Save cancelled.".into();
+            }
+            DialogResult::Failed(msg) => {
+                self.quit_after_save = false;
+                self.status = format!("Save dialog failed: {msg}");
+            }
+        }
+    }
+
+    /// Write the current buffer to `path` via `std::fs::write`, clear the dirty
+    /// flag, and adopt the path as the new save target. If this save was for a
+    /// pending quit, close the window once the bytes are on disk.
+    fn write_to(&mut self, path: &std::path::Path, ctx: &egui::Context) {
+        match std::fs::write(path, &self.bytes) {
+            Ok(()) => {
+                let name = name_from_path(path);
+                self.status = format!("Saved {} ({} bytes).", name, self.bytes.len());
+                self.file_name = Some(name);
+                self.file_path = Some(path.to_path_buf());
+                self.dirty = false;
+                if self.quit_after_save {
+                    self.quit_after_save = false;
+                    self.force_quit = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+            Err(e) => {
+                self.quit_after_save = false;
+                self.status = format!("Failed to save {}: {e}", path.display());
+            }
         }
     }
 
@@ -377,6 +625,11 @@ impl HexApp {
         if self.bytes.is_empty() {
             return;
         }
+        // Don't hijack the keyboard while a text field (find / go-to) is focused,
+        // or arrow keys and typed digits would leak into the hex grid.
+        if ctx.memory(|m| m.focused().is_some()) {
+            return;
+        }
         let last = self.bytes.len() - 1;
         let mut cur = self.cursor.unwrap_or(0);
         let mut moved = false;
@@ -400,6 +653,8 @@ impl HexApp {
             }
         });
         if moved {
+            // Moving abandons a half-typed hex byte.
+            self.pending_nibble = None;
             // Shift+arrows extend the selection; plain arrows move a single byte.
             if shift {
                 self.select_extend(cur);
@@ -407,6 +662,9 @@ impl HexApp {
                 self.select_single(cur);
             }
         }
+
+        // Characters typed this frame overwrite the byte under the cursor.
+        self.handle_edit_input(ctx);
     }
 }
 
@@ -414,6 +672,24 @@ impl eframe::App for HexApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Pick up the result of a background file dialog, if one is running.
         self.poll_open_dialog(ctx);
+        self.poll_save_dialog(ctx);
+
+        // Guard the window close against unsaved edits: cancel it and raise the
+        // confirmation dialog until the user has resolved it (force_quit).
+        if ctx.input(|i| i.viewport().close_requested()) && self.dirty && !self.force_quit {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm_quit = true;
+        }
+
+        // Keep the OS window title reflecting the file and its dirty state.
+        let title = match &self.file_name {
+            Some(name) => format!("imghex — {name}{}", if self.dirty { " •" } else { "" }),
+            None => "imghex — image-aware hex editor".to_string(),
+        };
+        if title != self.shown_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.shown_title = title;
+        }
 
         // Accept drag-and-drop of a file.
         let dropped: Vec<egui::DroppedFile> = ctx.input(|i| i.raw.dropped_files.clone());
@@ -462,6 +738,22 @@ impl eframe::App for HexApp {
                 if ui.button("📂 Open…").clicked() {
                     self.open_dialog();
                 }
+                let has_bytes = !self.bytes.is_empty();
+                if ui
+                    .add_enabled(has_bytes, egui::Button::new("💾 Save"))
+                    .on_hover_text(
+                        "Write changes back to the file (Save As if it has no path yet).",
+                    )
+                    .clicked()
+                {
+                    self.save(ctx);
+                }
+                if ui
+                    .add_enabled(has_bytes, egui::Button::new("Save As…"))
+                    .clicked()
+                {
+                    self.save_as_dialog();
+                }
                 ui.menu_button("🎨 Load demo ▾", |ui| {
                     use imghex_core::fixtures;
                     if ui.button("8-bpp gradient (256-color)").clicked() {
@@ -497,6 +789,10 @@ impl eframe::App for HexApp {
                 ui.separator();
                 if let Some(name) = &self.file_name {
                     ui.label(RichText::new(name).strong());
+                    if self.dirty {
+                        ui.label(RichText::new("• unsaved").color(EDIT_CURSOR))
+                            .on_hover_text("This buffer has edits that aren't saved to disk.");
+                    }
                 }
             });
 
@@ -567,6 +863,39 @@ impl eframe::App for HexApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             self.draw_hex(ui);
         });
+
+        // Unsaved-changes confirmation, shown when a quit was intercepted above.
+        if self.confirm_quit {
+            egui::Window::new("Unsaved changes")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(format!(
+                        "“{}” has unsaved edits.",
+                        self.file_name.as_deref().unwrap_or("This file")
+                    ));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Save & quit").clicked() {
+                            self.confirm_quit = false;
+                            // Close once the save completes (direct write closes
+                            // immediately; Save As closes when the dialog returns).
+                            self.quit_after_save = true;
+                            self.save(ctx);
+                        }
+                        if ui.button("Discard & quit").clicked() {
+                            self.confirm_quit = false;
+                            self.force_quit = true;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.confirm_quit = false;
+                            self.quit_after_save = false;
+                        }
+                    });
+                });
+        }
     }
 }
 
@@ -619,6 +948,8 @@ impl HexApp {
         let primary_down = ui.input(|i| i.pointer.primary_down());
         let shift = ui.input(|i| i.modifiers.shift);
         let mut hot: Option<usize> = None;
+        // Which column the hovered cell is in, so a click also picks the edit pane.
+        let mut hot_pane = self.edit_pane;
 
         let mut scroll = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -666,6 +997,7 @@ impl HexApp {
                         if let Some(p) = pointer_pos {
                             if resp.rect.contains(p) {
                                 hot = Some(off);
+                                hot_pane = EditPane::Hex;
                             }
                         }
                     }
@@ -682,6 +1014,7 @@ impl HexApp {
                         if let Some(p) = pointer_pos {
                             if resp.rect.contains(p) {
                                 hot = Some(off);
+                                hot_pane = EditPane::Ascii;
                             }
                         }
                     }
@@ -692,6 +1025,10 @@ impl HexApp {
         // Apply selection from the pointer.
         if let Some(off) = hot {
             if primary_pressed {
+                // Clicking a cell also chooses which column edits target, and
+                // abandons any half-typed hex byte.
+                self.edit_pane = hot_pane;
+                self.pending_nibble = None;
                 if shift {
                     self.select_extend(off);
                 } else {
@@ -726,13 +1063,23 @@ impl HexApp {
                 .rect_filled(rect, 2.0, Color32::from_white_alpha(28));
         }
         if self.cursor == Some(offset) {
-            ui.painter()
-                .rect_stroke(rect, 2.0, Stroke::new(2.0, Color32::WHITE));
+            // Highlight the cursor when the hex column is the active edit target.
+            let color = if self.edit_pane == EditPane::Hex {
+                EDIT_CURSOR
+            } else {
+                Color32::WHITE
+            };
+            ui.painter().rect_stroke(rect, 2.0, Stroke::new(2.0, color));
         }
+        // Show a half-typed hex byte ("N_") until the second nibble commits it.
+        let label = match (self.cursor == Some(offset), self.pending_nibble) {
+            (true, Some(high)) => format!("{high:X}_"),
+            _ => format!("{:02X}", self.bytes[offset]),
+        };
         ui.painter().text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
-            format!("{:02X}", self.bytes[offset]),
+            label,
             font.clone(),
             text_on(bg),
         );
@@ -759,8 +1106,12 @@ impl HexApp {
                 .rect_filled(rect, 2.0, Color32::from_white_alpha(28));
         }
         if self.cursor == Some(offset) {
-            ui.painter()
-                .rect_stroke(rect, 2.0, Stroke::new(1.5, Color32::WHITE));
+            let color = if self.edit_pane == EditPane::Ascii {
+                EDIT_CURSOR
+            } else {
+                Color32::WHITE
+            };
+            ui.painter().rect_stroke(rect, 2.0, Stroke::new(1.5, color));
         }
         let ch = if (0x20..0x7f).contains(&b) {
             b as char
@@ -1203,5 +1554,48 @@ fn channel_name(c: Channel) -> &'static str {
         Channel::Green => "Green",
         Channel::Blue => "Blue",
         Channel::Luma => "Luminance",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use imghex_core::fixtures;
+
+    #[test]
+    fn overwrite_reports_whether_it_changed() {
+        let mut bytes = vec![0x10, 0x20, 0x30];
+        // A real change returns true and mutates the buffer.
+        assert!(overwrite_byte(&mut bytes, 1, 0x99));
+        assert_eq!(bytes[1], 0x99);
+        // Writing the same value is a no-op.
+        assert!(!overwrite_byte(&mut bytes, 1, 0x99));
+        // Out-of-range offsets are ignored, not a panic.
+        assert!(!overwrite_byte(&mut bytes, 99, 0x00));
+        assert_eq!(bytes, vec![0x10, 0x99, 0x30]);
+    }
+
+    #[test]
+    fn edit_changes_what_the_parser_sees() {
+        // The core sanity test called out in the ticket: an overwrite edit feeds
+        // straight back into `parse_auto`, so mutating a structural byte changes
+        // the decoded model. Corrupting the BMP magic makes the parser reject it.
+        let mut bytes = fixtures::demo_indexed();
+        assert!(parse_auto(&bytes).is_ok(), "demo fixture should parse");
+        assert!(overwrite_byte(&mut bytes, 0, 0x00)); // was 'B' (0x42)
+        assert!(
+            parse_auto(&bytes).is_err(),
+            "corrupting the magic must break the parse"
+        );
+    }
+
+    #[test]
+    fn edit_preserves_length_so_offsets_stay_valid() {
+        // Phase 1 is overwrite-only: the buffer length is invariant, which is why
+        // no cursor/selection clamping is needed (that's phase 4's problem).
+        let mut bytes = fixtures::demo_indexed();
+        let before = bytes.len();
+        overwrite_byte(&mut bytes, before / 2, 0xAB);
+        assert_eq!(bytes.len(), before);
     }
 }
