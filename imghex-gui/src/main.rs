@@ -68,6 +68,12 @@ const ASCII_CELL_W: f32 = 9.0; // one ASCII character cell
 // column's cursor stays white), so it's obvious where a typed byte will land.
 const EDIT_CURSOR: Color32 = Color32::from_rgb(0xFF, 0xC0, 0x4D);
 
+// Stripe drawn along the bottom of a cell whose byte differs from the last
+// saved/loaded buffer. A saturated magenta so it reads on top of any region
+// color and never gets confused with the gold cursor outline (a warm yellow),
+// the white selection wash, or the muted region backgrounds.
+const MODIFIED_STRIPE: Color32 = Color32::from_rgb(0xFF, 0x2D, 0x9A);
+
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -112,6 +118,120 @@ fn overwrite_byte(bytes: &mut [u8], offset: usize, value: u8) -> bool {
     }
 }
 
+/// One committed overwrite: the byte at `offset` went from `old` to `new`.
+/// Overwrite-only editing keeps this trivial — no length change — so undo just
+/// restores `old` and redo re-applies `new` at the same offset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Edit {
+    offset: usize,
+    old: u8,
+    new: u8,
+}
+
+/// Undo/redo history plus the modified-byte set for the hex buffer.
+///
+/// The history is a classic two-stack model over `(offset, old, new)` edits, and
+/// the modified-set is every offset whose current byte differs from `baseline`
+/// (the bytes as of the last load/save). Both are pure and length-invariant, so
+/// this is unit-tested without any GUI (see the tests below) and the GUI just
+/// forwards `self.bytes` in and reads the affected offset back out.
+///
+/// NOTE: overwrite-only, to match phase-1 editing. When insert/delete lands
+/// (#8) the stored offsets and the modified-set become invalid across a length
+/// change and this whole model needs revisiting — don't extend it for insertion.
+struct EditHistory {
+    /// Applied edits, oldest first; the top is the next thing Ctrl+Z undoes.
+    undo: Vec<Edit>,
+    /// Edits undone but not superseded; the top is the next thing redo re-applies.
+    redo: Vec<Edit>,
+    /// Byte values as of the last load/save; an offset is "modified" when the
+    /// live buffer differs from this here.
+    baseline: Vec<u8>,
+    /// Offsets whose current byte differs from `baseline`.
+    modified: std::collections::HashSet<usize>,
+    /// `undo.len()` at the last save — the "saved baseline" position. Returning
+    /// the history to exactly here means the buffer matches disk (not dirty).
+    /// `None` once that position is stranded in a discarded redo branch.
+    saved_pos: Option<usize>,
+}
+
+impl EditHistory {
+    /// A fresh history for a just-loaded buffer: no edits, nothing modified, and
+    /// the current bytes as the clean baseline.
+    fn new(bytes: &[u8]) -> Self {
+        Self {
+            undo: Vec::new(),
+            redo: Vec::new(),
+            baseline: bytes.to_vec(),
+            modified: std::collections::HashSet::new(),
+            saved_pos: Some(0),
+        }
+    }
+
+    /// Recompute whether `offset` is modified after its byte became `value`.
+    fn refresh_modified(&mut self, offset: usize, value: u8) {
+        if self.baseline.get(offset) == Some(&value) {
+            self.modified.remove(&offset);
+        } else {
+            self.modified.insert(offset);
+        }
+    }
+
+    /// Record a committed overwrite (the byte is already written to the buffer).
+    /// Clears the redo stack — the standard "new edit forks history" behavior.
+    fn record(&mut self, offset: usize, old: u8, new: u8) {
+        self.undo.push(Edit { offset, old, new });
+        self.redo.clear();
+        // If the saved position lived in the redo branch we just discarded, it's
+        // no longer reachable, so the buffer can never return to "clean" by
+        // navigating history — only by saving again.
+        if let Some(pos) = self.saved_pos {
+            if pos >= self.undo.len() {
+                self.saved_pos = None;
+            }
+        }
+        self.refresh_modified(offset, new);
+    }
+
+    /// Undo the most recent edit, restoring its `old` byte in `bytes` and moving
+    /// it to the redo stack. Returns the affected offset (for cursor + reparse).
+    fn undo(&mut self, bytes: &mut [u8]) -> Option<usize> {
+        let edit = self.undo.pop()?;
+        bytes[edit.offset] = edit.old;
+        self.refresh_modified(edit.offset, edit.old);
+        self.redo.push(edit);
+        Some(edit.offset)
+    }
+
+    /// Redo the most recently undone edit, re-applying its `new` byte.
+    fn redo(&mut self, bytes: &mut [u8]) -> Option<usize> {
+        let edit = self.redo.pop()?;
+        bytes[edit.offset] = edit.new;
+        self.refresh_modified(edit.offset, edit.new);
+        self.undo.push(edit);
+        Some(edit.offset)
+    }
+
+    /// Adopt the current buffer as the saved baseline (on Save): keep the undo/
+    /// redo stacks so edits remain undoable across the save, but nothing differs
+    /// from disk anymore, and this history position is now the clean one.
+    fn mark_saved(&mut self, bytes: &[u8]) {
+        self.baseline = bytes.to_vec();
+        self.modified.clear();
+        self.saved_pos = Some(self.undo.len());
+    }
+
+    /// Whether the buffer differs from the last save — i.e. the history is not
+    /// sitting on the saved baseline position.
+    fn dirty(&self) -> bool {
+        self.saved_pos != Some(self.undo.len())
+    }
+
+    fn is_modified(&self, offset: usize) -> bool {
+        self.modified.contains(&offset)
+    }
+}
+
 /// Pick black or white text for legibility on top of `bg`.
 fn text_on(bg: Rgba) -> Color32 {
     if bg.luminance() > 140 {
@@ -119,6 +239,17 @@ fn text_on(bg: Rgba) -> Color32 {
     } else {
         Color32::WHITE
     }
+}
+
+/// Paint the modified-byte indicator: a solid `MODIFIED_STRIPE` bar along the
+/// bottom edge of a hex or ASCII cell `rect`. Shared by both column painters so
+/// the two stay identical.
+fn paint_modified_stripe(ui: &egui::Ui, rect: egui::Rect) {
+    let stripe = egui::Rect::from_min_max(
+        egui::pos2(rect.left(), rect.bottom() - 3.0),
+        egui::pos2(rect.right(), rect.bottom()),
+    );
+    ui.painter().rect_filled(stripe, 0.0, MODIFIED_STRIPE);
 }
 
 /// The outcome of running the native file dialog on a background thread.
@@ -151,8 +282,14 @@ struct HexApp {
     save_rx: Option<std::sync::mpsc::Receiver<DialogResult>>,
 
     // Editing state.
-    /// Unsaved edits since the last load/save.
+    /// Unsaved edits since the last load/save. Mirrors `history.dirty()` and is
+    /// refreshed from it after every commit/undo/redo so the title and the
+    /// close-guard have a plain flag to read.
     dirty: bool,
+    /// Overwrite-only undo/redo stacks + the modified-byte set. The single owner
+    /// of edit history; `commit_overwrite`, `undo`, `redo`, load and save all
+    /// route through it.
+    history: EditHistory,
     /// Which column typed characters overwrite (set by clicking a cell).
     edit_pane: EditPane,
     /// The first of two hex nibbles, typed but not yet committed. The hex cell
@@ -203,6 +340,7 @@ impl HexApp {
             open_rx: None,
             save_rx: None,
             dirty: false,
+            history: EditHistory::new(&[]),
             edit_pane: EditPane::Hex,
             pending_nibble: None,
             shown_title: String::new(),
@@ -239,6 +377,8 @@ impl HexApp {
         let init = if self.bytes.is_empty() { None } else { Some(0) };
         self.anchor = init;
         self.cursor = init;
+        // A new buffer resets undo/redo and the modified-set to a clean baseline.
+        self.history = EditHistory::new(&self.bytes);
         self.dirty = false;
         self.pending_nibble = None;
         self.edit_pane = EditPane::Hex;
@@ -310,16 +450,52 @@ impl HexApp {
         self.advance_cursor();
     }
 
-    /// Write `value` at `offset` and re-derive the model. Marks the buffer dirty
-    /// only when the byte actually changed.
+    /// Write `value` at `offset`, record it in the undo history, and re-derive
+    /// the model. The single choke point for a committed overwrite: only here do
+    /// we push to the undo stack and update the modified-set. Marks dirty only
+    /// when the byte actually changed.
     fn commit_overwrite(&mut self, offset: usize, value: u8) {
         self.pending_nibble = None;
+        let Some(&old) = self.bytes.get(offset) else {
+            return; // out of range — nothing to do
+        };
         if !overwrite_byte(&mut self.bytes, offset, value) {
-            return; // out of range or already equal — nothing to reparse
+            return; // already equal — no edit to record or reparse
         }
-        self.dirty = true;
+        self.history.record(offset, old, value);
+        self.dirty = self.history.dirty();
         self.reparse();
         self.status = format!("Set 0x{offset:08X} = 0x{value:02X}.");
+    }
+
+    /// Undo the most recent overwrite (Ctrl+Z): restore the old byte, refresh
+    /// derived state through the same reparse/dirty/modified-set path as an edit,
+    /// and move the cursor to the affected offset.
+    fn undo(&mut self) {
+        self.pending_nibble = None;
+        match self.history.undo(&mut self.bytes) {
+            Some(offset) => {
+                self.dirty = self.history.dirty();
+                self.reparse();
+                self.jump_to(offset);
+                self.status = format!("Undo · restored 0x{offset:08X}.");
+            }
+            None => self.status = "Nothing to undo.".into(),
+        }
+    }
+
+    /// Redo the most recently undone overwrite (Ctrl+Shift+Z / Ctrl+Y).
+    fn redo(&mut self) {
+        self.pending_nibble = None;
+        match self.history.redo(&mut self.bytes) {
+            Some(offset) => {
+                self.dirty = self.history.dirty();
+                self.reparse();
+                self.jump_to(offset);
+                self.status = format!("Redo · reapplied 0x{offset:08X}.");
+            }
+            None => self.status = "Nothing to redo.".into(),
+        }
     }
 
     /// Move the cursor one byte forward after an edit (clamped to the last byte),
@@ -548,6 +724,9 @@ impl HexApp {
                 self.status = format!("Saved {} ({} bytes).", name, self.bytes.len());
                 self.file_name = Some(name);
                 self.file_path = Some(path.to_path_buf());
+                // The buffer now matches disk: this history position is the clean
+                // baseline and nothing is "modified" anymore (edits stay undoable).
+                self.history.mark_saved(&self.bytes);
                 self.dirty = false;
                 if self.quit_after_save {
                     self.quit_after_save = false;
@@ -663,8 +842,32 @@ impl HexApp {
             }
         }
 
-        // Characters typed this frame overwrite the byte under the cursor.
-        self.handle_edit_input(ctx);
+        // Ctrl+Z undoes, Ctrl+Shift+Z / Ctrl+Y redo. `command` is Ctrl here and
+        // Cmd on macOS, matching the platform's usual editing shortcuts. These
+        // sit behind the same focus guard above, so they don't fire while a text
+        // field owns the keyboard.
+        let (do_undo, do_redo) = ctx.input(|i| {
+            if !i.modifiers.command {
+                return (false, false);
+            }
+            let shift = i.modifiers.shift;
+            let z = i.key_pressed(Key::Z);
+            let y = i.key_pressed(Key::Y);
+            (z && !shift, y || (z && shift))
+        });
+        if do_undo {
+            self.undo();
+        } else if do_redo {
+            self.redo();
+        } else {
+            // Characters typed this frame overwrite the byte under the cursor.
+            self.handle_edit_input(ctx);
+        }
+    }
+
+    /// Whether the byte at `offset` differs from the last saved/loaded buffer.
+    fn is_modified(&self, offset: usize) -> bool {
+        self.history.is_modified(offset)
     }
 }
 
@@ -1071,6 +1274,11 @@ impl HexApp {
             };
             ui.painter().rect_stroke(rect, 2.0, Stroke::new(2.0, color));
         }
+        // Modified-byte stripe along the bottom edge (drawn last so it stays
+        // visible under the gold cursor outline). Mirrored in the ASCII column.
+        if self.is_modified(offset) {
+            paint_modified_stripe(ui, rect);
+        }
         // Show a half-typed hex byte ("N_") until the second nibble commits it.
         let label = match (self.cursor == Some(offset), self.pending_nibble) {
             (true, Some(high)) => format!("{high:X}_"),
@@ -1112,6 +1320,9 @@ impl HexApp {
                 Color32::WHITE
             };
             ui.painter().rect_stroke(rect, 2.0, Stroke::new(1.5, color));
+        }
+        if self.is_modified(offset) {
+            paint_modified_stripe(ui, rect);
         }
         let ch = if (0x20..0x7f).contains(&b) {
             b as char
@@ -1597,5 +1808,140 @@ mod tests {
         let before = bytes.len();
         overwrite_byte(&mut bytes, before / 2, 0xAB);
         assert_eq!(bytes.len(), before);
+    }
+
+    /// Simulate the GUI's `commit_overwrite` choke point on a bare buffer:
+    /// capture the old byte, overwrite, and record the edit. Lets the tests
+    /// exercise the history + modified-set model without any egui state.
+    fn apply(history: &mut EditHistory, bytes: &mut [u8], offset: usize, value: u8) {
+        let old = bytes[offset];
+        if overwrite_byte(bytes, offset, value) {
+            history.record(offset, old, value);
+        }
+    }
+
+    #[test]
+    fn fresh_history_is_clean() {
+        let bytes = vec![0x10, 0x20, 0x30];
+        let h = EditHistory::new(&bytes);
+        assert!(!h.dirty());
+        assert!(!h.is_modified(0));
+    }
+
+    #[test]
+    fn undo_redo_round_trips_buffer_and_modified_set() {
+        let mut bytes = vec![0x10, 0x20, 0x30];
+        let mut h = EditHistory::new(&bytes);
+
+        apply(&mut h, &mut bytes, 1, 0x99);
+        assert_eq!(bytes, vec![0x10, 0x99, 0x30]);
+        assert!(h.is_modified(1));
+        assert!(h.dirty());
+
+        // Undo restores the byte, clears the stripe, and (back at the loaded
+        // baseline position) clears dirty.
+        assert_eq!(h.undo(&mut bytes), Some(1));
+        assert_eq!(bytes, vec![0x10, 0x20, 0x30]);
+        assert!(!h.is_modified(1));
+        assert!(!h.dirty());
+
+        // Redo re-applies it and restores the modified state.
+        assert_eq!(h.redo(&mut bytes), Some(1));
+        assert_eq!(bytes[1], 0x99);
+        assert!(h.is_modified(1));
+        assert!(h.dirty());
+
+        // Nothing left to redo.
+        assert_eq!(h.redo(&mut bytes), None);
+    }
+
+    #[test]
+    fn undo_only_clears_stripe_when_the_original_byte_returns() {
+        // Two edits to the same offset: undoing once lands on an intermediate
+        // value that still differs from the baseline, so the byte stays modified;
+        // undoing back to the original removes it from the set.
+        let mut bytes = vec![0x10];
+        let mut h = EditHistory::new(&bytes);
+        apply(&mut h, &mut bytes, 0, 0x20);
+        apply(&mut h, &mut bytes, 0, 0x30);
+        assert!(h.is_modified(0));
+
+        h.undo(&mut bytes);
+        assert_eq!(bytes[0], 0x20);
+        assert!(
+            h.is_modified(0),
+            "0x20 still differs from the 0x10 baseline"
+        );
+
+        h.undo(&mut bytes);
+        assert_eq!(bytes[0], 0x10);
+        assert!(
+            !h.is_modified(0),
+            "restoring the original byte clears the stripe"
+        );
+        assert!(!h.dirty());
+    }
+
+    #[test]
+    fn a_new_edit_clears_the_redo_stack() {
+        let mut bytes = vec![0x00, 0x00, 0x00];
+        let mut h = EditHistory::new(&bytes);
+        apply(&mut h, &mut bytes, 0, 0x01);
+        apply(&mut h, &mut bytes, 1, 0x02);
+        h.undo(&mut bytes);
+        assert!(!h.redo.is_empty(), "an undo leaves something to redo");
+
+        apply(&mut h, &mut bytes, 2, 0x03);
+        assert!(
+            h.redo.is_empty(),
+            "a new edit forks history and drops the redo branch"
+        );
+        assert_eq!(h.redo(&mut bytes), None);
+    }
+
+    #[test]
+    fn save_baseline_tracks_dirty_across_undo_and_redo() {
+        let mut bytes = vec![0x00, 0x00];
+        let mut h = EditHistory::new(&bytes);
+        apply(&mut h, &mut bytes, 0, 0xAA);
+        apply(&mut h, &mut bytes, 1, 0xBB);
+        assert!(h.dirty());
+
+        // Saving adopts the current buffer as the clean baseline: no stripes, not
+        // dirty, but the edits stay undoable.
+        h.mark_saved(&bytes);
+        assert!(!h.dirty());
+        assert!(!h.is_modified(0) && !h.is_modified(1));
+
+        // Undoing past the save diverges from disk: dirty again, and the reverted
+        // byte now differs from the saved baseline, so it is modified.
+        h.undo(&mut bytes);
+        assert!(h.dirty());
+        assert!(h.is_modified(1), "0x00 differs from the saved 0xBB");
+
+        // Redoing back onto the saved position is clean again.
+        h.redo(&mut bytes);
+        assert!(!h.dirty());
+        assert!(!h.is_modified(1));
+    }
+
+    #[test]
+    fn a_new_edit_strands_a_saved_position_in_the_discarded_branch() {
+        // Save, then undo away from the save point, then make a fresh edit. The
+        // saved position lived in the redo branch we just dropped, so it can no
+        // longer be reached by navigating history — the buffer stays dirty until
+        // the next save.
+        let mut bytes = vec![0x00, 0x00];
+        let mut h = EditHistory::new(&bytes);
+        apply(&mut h, &mut bytes, 0, 0x01);
+        h.mark_saved(&bytes);
+        apply(&mut h, &mut bytes, 1, 0x02);
+        h.undo(&mut bytes); // back onto the saved position → clean
+        assert!(!h.dirty());
+        h.undo(&mut bytes); // before the save → dirty
+        assert!(h.dirty());
+
+        apply(&mut h, &mut bytes, 0, 0x09); // forks history, strands the save point
+        assert!(h.dirty());
     }
 }
