@@ -359,3 +359,43 @@ pub fn jpeg_dual_dht() -> Vec<u8> {
     out.extend_from_slice(&[0xFF, 0xD9]); // EOI
     out
 }
+
+/// Build a minimal three-component (YCbCr) JPEG that exercises the per-component
+/// SOF and SOS decoding: SOI, a progressive SOF2 whose three components carry
+/// distinct sampling factors and quantization-table selectors, an SOS whose
+/// three scan entries carry distinct DC/AC Huffman-table selectors and
+/// non-baseline spectral-selection bytes, then EOI. There is no DQT/DHT or
+/// entropy-coded scan data — the fixture exists to pin down the frame- and
+/// scan-header component fields, not to be decoded.
+///
+/// Byte layout (used by the tests' offset assertions): SOI at 0, the SOF2
+/// payload begins at offset 6 (SOI=2, `FF C2` + 2-byte length = 4); the SOS
+/// payload begins at offset 25.
+pub fn jpeg_ycbcr() -> Vec<u8> {
+    let (width, height) = (32u16, 16u16);
+    // SOF2 (progressive DCT): precision 8, dimensions, three components.
+    let mut sof = vec![0x08];
+    sof.extend_from_slice(&height.to_be_bytes());
+    sof.extend_from_slice(&width.to_be_bytes());
+    sof.push(0x03); // component count
+    sof.extend_from_slice(&[0x01, 0x22, 0x00]); // Y:  id 1, 2×2 sampling, quant table 0
+    sof.extend_from_slice(&[0x02, 0x11, 0x01]); // Cb: id 2, 1×1 sampling, quant table 1
+    sof.extend_from_slice(&[0x03, 0x21, 0x01]); // Cr: id 3, 2×1 sampling, quant table 1
+
+    // SOS: three scan components with distinct DC/AC table selectors, and a
+    // non-baseline spectral selection (Ss=1, Se=63, Ah=1, Al=2).
+    let sos = [
+        0x03, // component count
+        0x01, 0x00, // component 1: selector 1, DC table 0, AC table 0
+        0x02, 0x11, // component 2: selector 2, DC table 1, AC table 1
+        0x03, 0x12, // component 3: selector 3, DC table 1, AC table 2
+        0x01, 0x3F, 0x12, // Ss=1, Se=63, Ah=1, Al=2
+    ];
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&[0xFF, 0xD8]); // SOI
+    push_jpeg_segment(&mut out, 0xC2, &sof);
+    push_jpeg_segment(&mut out, 0xDA, &sos);
+    out.extend_from_slice(&[0xFF, 0xD9]); // EOI
+    out
+}

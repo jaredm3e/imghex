@@ -167,6 +167,138 @@ fn decode_dht(payload: &[u8], base: usize, fields: &mut Vec<Field>) -> Vec<(u8, 
     tables
 }
 
+/// Decode the per-component parameters of an SOF (Start Of Frame) payload into
+/// fine-grained fields.
+///
+/// The frame header is a 1-byte precision, 2-byte height, 2-byte width and a
+/// 1-byte component count `count` (all decoded by the caller), followed by
+/// `count` three-byte component specifications. Each spec is a component id, a
+/// sampling-factor byte (`H<<4 | V` — high nibble horizontal, low nibble
+/// vertical), and a quantization-table selector (which DQT table id this
+/// component uses). `base` is the file offset of the first payload byte. Only
+/// complete three-byte specs that fit within the payload are decoded, so a
+/// component count that overruns the segment stops early rather than panicking.
+fn decode_sof_components(payload: &[u8], base: usize, count: usize, fields: &mut Vec<Field>) {
+    // The component specs follow the six-byte frame header.
+    let mut i = 6usize;
+    for c in 0..count {
+        if i + 3 > payload.len() {
+            // Truncated spec: the declared component count overruns the payload.
+            break;
+        }
+        let id = payload[i];
+        let sampling = payload[i + 1];
+        let h = sampling >> 4; // horizontal sampling factor
+        let v = sampling & 0x0F; // vertical sampling factor
+        let quant = payload[i + 2];
+        let off = base + i;
+        fields.push(Field::new(
+            off,
+            off + 1,
+            format!("component[{c}].id"),
+            format!("{id}"),
+            "Component identifier (the id the scan headers reference this component by).",
+        ));
+        fields.push(Field::new(
+            off + 1,
+            off + 2,
+            format!("component[{c}].sampling"),
+            format!("{h}×{v}"),
+            "Sampling factors: high nibble is the horizontal factor, low nibble the vertical factor.",
+        ));
+        fields.push(Field::new(
+            off + 2,
+            off + 3,
+            format!("component[{c}].quant_table"),
+            format!("{quant}"),
+            "Quantization-table selector: the DQT table id used to dequantize this component.",
+        ));
+        i += 3;
+    }
+}
+
+/// Decode an SOS (Start Of Scan) header payload into fine-grained fields.
+///
+/// The scan header is a 1-byte component count `n`, then `n` two-byte component
+/// specifications, then three spectral-selection bytes. Each component spec is a
+/// component selector (which frame component, by id, this scan entry codes) and
+/// a `Td<<4 | Ta` byte — high nibble the DC Huffman-table id, low nibble the AC
+/// Huffman-table id. The trailing three bytes are Ss (start of spectral
+/// selection), Se (end) and `Ah<<4 | Al` (successive-approximation bit
+/// positions); non-default values there mark a progressive scan. `base` is the
+/// file offset of the first payload byte. Reads nothing past the payload, so a
+/// truncated scan header stops early rather than panicking.
+fn decode_sos(payload: &[u8], base: usize, fields: &mut Vec<Field>) {
+    if payload.is_empty() {
+        return;
+    }
+    let count = payload[0] as usize;
+    fields.push(Field::new(
+        base,
+        base + 1,
+        "scan_components",
+        format!("{count}"),
+        "Number of image components coded in this scan.",
+    ));
+    let mut i = 1usize;
+    for c in 0..count {
+        if i + 2 > payload.len() {
+            // Truncated spec: the declared component count overruns the payload.
+            break;
+        }
+        let selector = payload[i];
+        let tables = payload[i + 1];
+        let td = tables >> 4; // DC Huffman-table id
+        let ta = tables & 0x0F; // AC Huffman-table id
+        let off = base + i;
+        fields.push(Field::new(
+            off,
+            off + 1,
+            format!("scan[{c}].selector"),
+            format!("{selector}"),
+            "Component selector: which frame component (by id) this scan entry codes.",
+        ));
+        fields.push(Field::new(
+            off + 1,
+            off + 2,
+            format!("scan[{c}].huff_tables"),
+            format!("DC {td}, AC {ta}"),
+            "Huffman-table selectors: high nibble is the DC table id, low nibble the AC table id.",
+        ));
+        i += 2;
+    }
+    // Three spectral-selection bytes follow the component specs.
+    if i + 3 <= payload.len() {
+        let ss = payload[i];
+        let se = payload[i + 1];
+        let ah_al = payload[i + 2];
+        let ah = ah_al >> 4; // successive-approximation high bit position
+        let al = ah_al & 0x0F; // successive-approximation low bit position
+        let off = base + i;
+        fields.push(Field::new(
+            off,
+            off + 1,
+            "spectral_start",
+            format!("{ss}"),
+            "Ss: start of spectral selection — first DCT coefficient index coded in this scan (0 for a baseline scan).",
+        ));
+        fields.push(Field::new(
+            off + 1,
+            off + 2,
+            "spectral_end",
+            format!("{se}"),
+            "Se: end of spectral selection — last DCT coefficient index coded (63 for a baseline scan).",
+        ));
+        fields.push(Field::new(
+            off + 2,
+            off + 3,
+            "successive_approx",
+            format!("Ah {ah}, Al {al}"),
+            "Successive-approximation bit positions: high nibble Ah, low nibble Al (both 0 for a baseline scan; non-zero marks a progressive scan).",
+        ));
+    }
+}
+
 /// Does this marker stand alone (no length + payload)? SOI/EOI/TEM/RSTn do.
 fn is_standalone(marker: u8) -> bool {
     matches!(marker, 0xD8 | 0xD9 | 0x01) || (0xD0..=0xD7).contains(&marker)
@@ -438,6 +570,7 @@ impl ImageFormat for JpegFormat {
                     format!("{components}"),
                     "Number of image components (1 = grayscale, 3 = YCbCr color, 4 = CMYK/YCCK).",
                 ));
+                decode_sof_components(payload, payload_start, components as usize, &mut fields);
             } else if marker == 0xE0 && payload.len() >= 7 && &payload[0..5] == b"JFIF\0" {
                 let ver = format!("{}.{:02}", payload[5], payload[6]);
                 jfif_version = Some(ver.clone());
@@ -489,6 +622,8 @@ impl ImageFormat for JpegFormat {
                 quant_tables += decode_dqt(payload, payload_start, &mut fields);
             } else if marker == 0xC4 {
                 huff_tables.extend(decode_dht(payload, payload_start, &mut fields));
+            } else if marker == 0xDA {
+                decode_sos(payload, payload_start, &mut fields);
             }
 
             if marker == 0xDA {
