@@ -295,3 +295,188 @@ fn truncated_after_soi_does_not_panic() {
     assert_eq!(img.format_name, "JPEG");
     assert!(img.pixel_info.is_none());
 }
+
+#[test]
+fn sof_component_fields_baseline() {
+    // The baseline fixture's SOF0 has one component: id 1, 1×1 sampling, quant
+    // table 0. Each per-component parameter becomes its own field.
+    let jpg = fixtures::jpeg_baseline(16, 16);
+    let img = parse_auto(&jpg).unwrap();
+
+    let id = img
+        .fields
+        .iter()
+        .find(|f| f.name == "component[0].id")
+        .expect("component id field");
+    assert_eq!(id.value, "1");
+    assert_eq!(id.len(), 1);
+
+    // The specs sit immediately after the component-count byte.
+    let count = img.fields.iter().find(|f| f.name == "components").unwrap();
+    assert_eq!(id.start, count.end);
+
+    let sampling = img
+        .fields
+        .iter()
+        .find(|f| f.name == "component[0].sampling")
+        .unwrap();
+    assert_eq!(sampling.value, "1×1");
+    let quant = img
+        .fields
+        .iter()
+        .find(|f| f.name == "component[0].quant_table")
+        .unwrap();
+    assert_eq!(quant.value, "0");
+
+    // Only the one declared component, so no second spec.
+    assert!(!img.fields.iter().any(|f| f.name == "component[1].id"));
+}
+
+#[test]
+fn sos_header_fields_baseline() {
+    // The baseline fixture's SOS has one scan component (selector 1, DC/AC
+    // table 0) and baseline spectral selection (Ss=0, Se=63, Ah=Al=0).
+    let jpg = fixtures::jpeg_baseline(16, 16);
+    let img = parse_auto(&jpg).unwrap();
+
+    let count = img
+        .fields
+        .iter()
+        .find(|f| f.name == "scan_components")
+        .expect("scan component count field");
+    assert_eq!(count.value, "1");
+
+    let selector = img
+        .fields
+        .iter()
+        .find(|f| f.name == "scan[0].selector")
+        .unwrap();
+    assert_eq!(selector.value, "1");
+    // The scan specs sit immediately after the scan-component-count byte.
+    assert_eq!(selector.start, count.end);
+
+    let huff = img
+        .fields
+        .iter()
+        .find(|f| f.name == "scan[0].huff_tables")
+        .unwrap();
+    assert_eq!(huff.value, "DC 0, AC 0");
+
+    let ss = img
+        .fields
+        .iter()
+        .find(|f| f.name == "spectral_start")
+        .unwrap();
+    assert_eq!(ss.value, "0");
+    let se = img
+        .fields
+        .iter()
+        .find(|f| f.name == "spectral_end")
+        .unwrap();
+    assert_eq!(se.value, "63");
+    let approx = img
+        .fields
+        .iter()
+        .find(|f| f.name == "successive_approx")
+        .unwrap();
+    assert_eq!(approx.value, "Ah 0, Al 0");
+}
+
+#[test]
+fn sof_component_fields_three_components() {
+    // The YCbCr fixture's SOF2 has three components with distinct sampling
+    // factors and quant-table selectors. The payload begins at offset 6, so the
+    // three-byte specs occupy 12..21.
+    let jpg = fixtures::jpeg_ycbcr();
+    let img = parse_auto(&jpg).unwrap();
+
+    let by_offset = |off: usize| img.fields.iter().find(|f| f.start == off).unwrap();
+
+    // Y component (id 1, 2×2, quant 0) at offsets 12..15.
+    assert_eq!(by_offset(12).name, "component[0].id");
+    assert_eq!(by_offset(12).value, "1");
+    assert_eq!(by_offset(13).name, "component[0].sampling");
+    assert_eq!(by_offset(13).value, "2×2");
+    assert_eq!(by_offset(14).name, "component[0].quant_table");
+    assert_eq!(by_offset(14).value, "0");
+
+    // Cb component (id 2, 1×1, quant 1) at offsets 15..18.
+    assert_eq!(by_offset(15).value, "2"); // component[1].id
+    assert_eq!(by_offset(16).value, "1×1"); // component[1].sampling
+    assert_eq!(by_offset(17).value, "1"); // component[1].quant_table
+
+    // Cr component (id 3, 2×1, quant 1) at offsets 18..21.
+    assert_eq!(by_offset(18).name, "component[2].id");
+    assert_eq!(by_offset(18).value, "3");
+    assert_eq!(by_offset(19).value, "2×1"); // component[2].sampling
+    assert_eq!(by_offset(20).value, "1"); // component[2].quant_table
+
+    // Three components decoded; the summary reflects the color count.
+    assert_eq!(
+        img.fields
+            .iter()
+            .filter(|f| f.name.ends_with(".id") && f.name.starts_with("component["))
+            .count(),
+        3
+    );
+    assert!(img
+        .summary
+        .iter()
+        .any(|(k, v)| k == "Components" && v.contains("YCbCr")));
+}
+
+#[test]
+fn sos_header_fields_three_components() {
+    // The YCbCr fixture's SOS codes three components with distinct DC/AC table
+    // selectors and a progressive spectral selection. The payload begins at
+    // offset 25.
+    let jpg = fixtures::jpeg_ycbcr();
+    let img = parse_auto(&jpg).unwrap();
+
+    let by_offset = |off: usize| img.fields.iter().find(|f| f.start == off).unwrap();
+
+    assert_eq!(by_offset(25).name, "scan_components");
+    assert_eq!(by_offset(25).value, "3");
+
+    // Component 1: selector 1, DC 0 / AC 0.
+    assert_eq!(by_offset(26).name, "scan[0].selector");
+    assert_eq!(by_offset(26).value, "1");
+    assert_eq!(by_offset(27).name, "scan[0].huff_tables");
+    assert_eq!(by_offset(27).value, "DC 0, AC 0");
+
+    // Component 2: selector 2, DC 1 / AC 1.
+    assert_eq!(by_offset(28).value, "2");
+    assert_eq!(by_offset(29).value, "DC 1, AC 1");
+
+    // Component 3: selector 3, DC 1 / AC 2.
+    assert_eq!(by_offset(30).value, "3");
+    assert_eq!(by_offset(31).value, "DC 1, AC 2");
+
+    // Progressive spectral selection: Ss=1, Se=63, Ah=1, Al=2.
+    assert_eq!(by_offset(32).name, "spectral_start");
+    assert_eq!(by_offset(32).value, "1");
+    assert_eq!(by_offset(33).name, "spectral_end");
+    assert_eq!(by_offset(33).value, "63");
+    assert_eq!(by_offset(34).name, "successive_approx");
+    assert_eq!(by_offset(34).value, "Ah 1, Al 2");
+}
+
+#[test]
+fn overrunning_sof_component_count_does_not_panic() {
+    // An SOF0 header that *claims* 255 components but carries only one 3-byte
+    // spec. The parser must decode the one present spec and stop, never reading
+    // past the payload.
+    let mut jpg = vec![0xFF, 0xD8]; // SOI
+                                    // FF C0, length 0x000B (11 = 2 length bytes + 9 payload bytes), then the
+                                    // 6-byte frame header with a component count of 0xFF, then one 3-byte spec.
+    jpg.extend_from_slice(&[
+        0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x10, 0x00, 0x10, 0xFF, 0x01, 0x11, 0x00,
+    ]);
+    jpg.extend_from_slice(&[0xFF, 0xD9]); // EOI
+
+    let img = parse_auto(&jpg).unwrap();
+    assert_eq!(img.format_name, "JPEG");
+    // Exactly one component spec was decoded despite the bogus count of 255.
+    assert!(img.fields.iter().any(|f| f.name == "component[0].id"));
+    assert!(!img.fields.iter().any(|f| f.name == "component[1].id"));
+}
