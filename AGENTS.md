@@ -64,9 +64,29 @@ CI). Don't rely on CI to catch a gui-side break.
 - Post review feedback as a **PR comment** (`gh pr comment <n>`). GitHub blocks
   approving your own PR, and agents share the `jaredm3e` identity, so a formal
   "Approve" isn't available — a thorough comment is the deliverable.
-- **The maintainer merges.** Don't merge your own PRs.
+- **Never merge your own PR.** Who merges is set by the merge policy below.
 - When you review, verify the claims: run the tests, `fmt`, and `clippy` against
   the branch rather than trusting the description.
+
+## Merging
+
+A PR merges only after it is green and has passed review with any **blocking**
+findings fixed. Who performs the merge depends on what the change touches:
+
+- **Pure-decoder changes (`imghex-core` only)** — parser/field/summary work
+  covered by the automated tests and code review. Once green and review-clean,
+  the coordinating reviewer may merge these directly; there's no runtime behavior
+  a human needs to eyeball.
+- **GUI / interactive changes (`imghex-gui` runtime behavior)** — anything whose
+  correctness shows up only when the app runs (editing, keyboard/mouse handling,
+  dialogs, the rendered preview and bit-plane views). egui can't be driven in CI,
+  so these are **held for the maintainer to manually test before merge**, even
+  when green and review-clean. The PR description must carry a short **manual
+  test checklist** (edit a byte → …, Save → reopen → …) so the maintainer can run
+  through it quickly.
+- When several GUI PRs are ready at once, they are **queued together** and handed
+  to the maintainer as a batch with each PR's checklist, rather than one at a
+  time, so review sessions stay efficient.
 
 ## Coding conventions
 
