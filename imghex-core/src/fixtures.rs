@@ -335,6 +335,123 @@ pub fn jpeg_dual_dqt() -> Vec<u8> {
     out
 }
 
+/// Wrap a TIFF payload in an APP1/EXIF JPEG: `SOI · APP1("Exif\0\0" + tiff) · EOI`.
+///
+/// The TIFF header therefore begins at file offset 12 (SOI = 2, `FF E1` + 2-byte
+/// length = 4, `Exif\0\0` = 6), which is the `base` the parser decodes against.
+fn wrap_exif_jpeg(tiff: &[u8]) -> Vec<u8> {
+    let mut app1 = Vec::new();
+    app1.extend_from_slice(b"Exif\0\0");
+    app1.extend_from_slice(tiff);
+    let mut out = Vec::new();
+    out.extend_from_slice(&[0xFF, 0xD8]); // SOI
+    push_jpeg_segment(&mut out, 0xE1, &app1);
+    out.extend_from_slice(&[0xFF, 0xD9]); // EOI
+    out
+}
+
+/// Append a 12-byte little-endian TIFF/IFD entry.
+fn push_ifd_entry_le(v: &mut Vec<u8>, tag: u16, typ: u16, count: u32, value: u32) {
+    push_u16(v, tag);
+    push_u16(v, typ);
+    push_u32(v, count);
+    push_u32(v, value);
+}
+
+/// Build a real little-endian (`II`) APP1/EXIF JPEG.
+///
+/// IFD0 carries Make="imghex" (ASCII, out-of-line), Orientation=1 (SHORT,
+/// inline), DateTime (ASCII, out-of-line) and an ExifIFD pointer (tag 0x8769).
+/// The ExifIFD carries ExposureTime=1/100 (RATIONAL) and ISOSpeedRatings=400
+/// (SHORT). Offsets are relative to the TIFF header start; the fixed layout is
+/// documented inline so tests can assert exact positions.
+pub fn jpeg_exif_le() -> Vec<u8> {
+    const MAKE: &[u8] = b"imghex\0"; // 7 bytes
+    const DATETIME: &[u8] = b"2026:07:14 12:00:00\0"; // 20 bytes
+
+    // Layout (relative to TIFF start):
+    //   0  header (II, magic, IFD0 offset = 8)
+    //   8  IFD0: count(2) + 4 entries(48) + next-IFD(4) → 10..62
+    //   62 Make data (7)          → 62..69
+    //   69 DateTime data (20)     → 69..89
+    //   89 ExifIFD: count(2) + 2 entries(24) + next-IFD(4) → 89..119
+    //   119 ExposureTime rational (8) → 119..127
+    let make_off = 62u32;
+    let datetime_off = 69u32;
+    let exififd_off = 89u32;
+    let exposure_off = 119u32;
+
+    let mut t = Vec::new();
+    // TIFF header.
+    t.extend_from_slice(b"II");
+    push_u16(&mut t, 42);
+    push_u32(&mut t, 8); // IFD0 at offset 8
+                         // IFD0.
+    push_u16(&mut t, 4); // entry count
+    push_ifd_entry_le(&mut t, 0x010F, 2, MAKE.len() as u32, make_off); // Make (ASCII)
+    push_ifd_entry_le(&mut t, 0x0112, 3, 1, 1); // Orientation (SHORT, inline = 1)
+    push_ifd_entry_le(&mut t, 0x0132, 2, DATETIME.len() as u32, datetime_off); // DateTime
+    push_ifd_entry_le(&mut t, 0x8769, 4, 1, exififd_off); // ExifIFD pointer (LONG)
+    push_u32(&mut t, 0); // next-IFD offset (none)
+                         // Out-of-line IFD0 data.
+    t.extend_from_slice(MAKE);
+    t.extend_from_slice(DATETIME);
+    // ExifIFD.
+    push_u16(&mut t, 2); // entry count
+    push_ifd_entry_le(&mut t, 0x829A, 5, 1, exposure_off); // ExposureTime (RATIONAL)
+    push_ifd_entry_le(&mut t, 0x8827, 3, 1, 400); // ISOSpeedRatings (SHORT, inline)
+    push_u32(&mut t, 0); // next-IFD offset (none)
+                         // ExposureTime rational data: 1/100.
+    push_u32(&mut t, 1);
+    push_u32(&mut t, 100);
+
+    debug_assert_eq!(t.len(), 127, "unexpected EXIF TIFF layout size");
+    wrap_exif_jpeg(&t)
+}
+
+/// Build a real big-endian (`MM`) APP1/EXIF JPEG with Make="imghex" (ASCII,
+/// out-of-line) and Orientation=6 (SHORT, inline) in IFD0 — the endianness
+/// counterpart of [`jpeg_exif_le`].
+pub fn jpeg_exif_be() -> Vec<u8> {
+    // IFD0: count(2)@8 + 2 entries(24)@10..34 + next-IFD(4)@34..38 → data at 38.
+    const MAKE: &[u8] = b"imghex\0"; // 7 bytes, out-of-line at offset 38
+    let make_off = 38u32;
+
+    let mut t = Vec::new();
+    // TIFF header (big-endian).
+    t.extend_from_slice(b"MM");
+    t.extend_from_slice(&42u16.to_be_bytes());
+    t.extend_from_slice(&8u32.to_be_bytes()); // IFD0 at offset 8
+                                              // IFD0: count(2) + 2 entries(24) + next-IFD(4) → data at 34.
+    t.extend_from_slice(&2u16.to_be_bytes()); // entry count
+                                              // Make (ASCII), out-of-line.
+    t.extend_from_slice(&0x010Fu16.to_be_bytes());
+    t.extend_from_slice(&2u16.to_be_bytes());
+    t.extend_from_slice(&(MAKE.len() as u32).to_be_bytes());
+    t.extend_from_slice(&make_off.to_be_bytes());
+    // Orientation (SHORT, inline = 6). The value occupies the first 2 value bytes.
+    t.extend_from_slice(&0x0112u16.to_be_bytes());
+    t.extend_from_slice(&3u16.to_be_bytes());
+    t.extend_from_slice(&1u32.to_be_bytes());
+    t.extend_from_slice(&6u16.to_be_bytes());
+    t.extend_from_slice(&0u16.to_be_bytes()); // pad the 4-byte value slot
+    t.extend_from_slice(&0u32.to_be_bytes()); // next-IFD offset (none)
+    t.extend_from_slice(MAKE);
+
+    wrap_exif_jpeg(&t)
+}
+
+/// Build an APP1/EXIF JPEG whose TIFF header declares a bogus IFD0 offset far
+/// past the payload — for asserting the parser neither panics nor loops on
+/// untrusted offsets.
+pub fn jpeg_exif_bad_offset() -> Vec<u8> {
+    let mut t = Vec::new();
+    t.extend_from_slice(b"II");
+    push_u16(&mut t, 42);
+    push_u32(&mut t, 0xFFFF_FFFF); // IFD0 offset way out of bounds
+    wrap_exif_jpeg(&t)
+}
+
 /// Build a minimal JPEG (SOI, one DHT, EOI) whose single DHT segment defines two
 /// Huffman tables back to back: a DC table (id 0) with 3 symbols, and an AC
 /// table (id 0) with 3 symbols — exercising multi-table decoding and the

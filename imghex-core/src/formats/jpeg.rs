@@ -167,6 +167,310 @@ fn decode_dht(payload: &[u8], base: usize, fields: &mut Vec<Field>) -> Vec<(u8, 
     tables
 }
 
+/// Read a big- or little-endian `u16` at `o`, bounds-checked. `le` selects the
+/// TIFF file's declared byte order.
+fn tiff_u16(b: &[u8], o: usize, le: bool) -> Option<u16> {
+    let s = b.get(o..o + 2)?;
+    let a = [s[0], s[1]];
+    Some(if le {
+        u16::from_le_bytes(a)
+    } else {
+        u16::from_be_bytes(a)
+    })
+}
+
+/// Read a big- or little-endian `u32` at `o`, bounds-checked.
+fn tiff_u32(b: &[u8], o: usize, le: bool) -> Option<u32> {
+    let s = b.get(o..o + 4)?;
+    let a = [s[0], s[1], s[2], s[3]];
+    Some(if le {
+        u32::from_le_bytes(a)
+    } else {
+        u32::from_be_bytes(a)
+    })
+}
+
+/// A readable name for the EXIF/TIFF tags we prioritize; `None` for the rest.
+fn exif_tag_name(tag: u16) -> Option<&'static str> {
+    Some(match tag {
+        0x010F => "Make",
+        0x0110 => "Model",
+        0x0112 => "Orientation",
+        0x0132 => "DateTime",
+        0x8769 => "ExifIFD",
+        0x8825 => "GPSInfoIFD",
+        0x829A => "ExposureTime",
+        0x829D => "FNumber",
+        0x8827 => "ISOSpeedRatings",
+        _ => return None,
+    })
+}
+
+/// A short name for a TIFF field type code.
+fn exif_type_name(typ: u16) -> &'static str {
+    match typ {
+        1 => "BYTE",
+        2 => "ASCII",
+        3 => "SHORT",
+        4 => "LONG",
+        5 => "RATIONAL",
+        6 => "SBYTE",
+        7 => "UNDEFINED",
+        8 => "SSHORT",
+        9 => "SLONG",
+        10 => "SRATIONAL",
+        _ => "?",
+    }
+}
+
+/// Bytes occupied by one element of a TIFF field type (0 if unknown).
+fn exif_type_size(typ: u16) -> usize {
+    match typ {
+        1 | 2 | 6 | 7 => 1,
+        3 | 8 => 2,
+        4 | 9 => 4,
+        5 | 10 => 8,
+        _ => 0,
+    }
+}
+
+/// Format a TIFF field's payload into a human-readable string. `data_off` is the
+/// index of the first data byte within `tiff`, `count` the element count. All
+/// reads are bounds-checked, so an out-of-range offset yields an empty/partial
+/// string rather than a panic.
+fn format_exif_value(tiff: &[u8], data_off: usize, typ: u16, count: usize, le: bool) -> String {
+    match typ {
+        // ASCII: NUL-terminated text; show up to the first NUL.
+        2 => {
+            let end = data_off.saturating_add(count).min(tiff.len());
+            let raw = tiff.get(data_off..end).unwrap_or(&[]);
+            let text = raw.split(|&b| b == 0).next().unwrap_or(&[]);
+            String::from_utf8_lossy(text).into_owned()
+        }
+        // BYTE / SBYTE / UNDEFINED: list the raw byte values.
+        1 | 6 | 7 => {
+            let end = data_off.saturating_add(count).min(tiff.len());
+            tiff.get(data_off..end)
+                .unwrap_or(&[])
+                .iter()
+                .map(|b| b.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+        // SHORT / SSHORT.
+        3 | 8 => (0..count)
+            .filter_map(|k| tiff_u16(tiff, data_off + k * 2, le))
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+        // LONG / SLONG.
+        4 | 9 => (0..count)
+            .filter_map(|k| tiff_u32(tiff, data_off + k * 4, le))
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+        // RATIONAL / SRATIONAL: two LONGs, numerator then denominator.
+        5 | 10 => (0..count)
+            .filter_map(|k| {
+                let num = tiff_u32(tiff, data_off + k * 8, le)?;
+                let den = tiff_u32(tiff, data_off + k * 8 + 4, le)?;
+                Some(format!("{num}/{den}"))
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => String::new(),
+    }
+}
+
+/// Annotate a raw EXIF Orientation value (1..8) with its meaning for display.
+fn describe_orientation(value: &str) -> String {
+    let meaning = match value {
+        "1" => "normal",
+        "2" => "mirrored horizontal",
+        "3" => "rotated 180°",
+        "4" => "mirrored vertical",
+        "5" => "mirrored horizontal, rotated 270° CW",
+        "6" => "rotated 90° CW",
+        "7" => "mirrored horizontal, rotated 90° CW",
+        "8" => "rotated 270° CW",
+        _ => return value.to_string(),
+    };
+    format!("{value} ({meaning})")
+}
+
+/// Headline EXIF values worth surfacing in the file summary.
+#[derive(Default)]
+struct ExifSummary {
+    make: Option<String>,
+    model: Option<String>,
+    orientation: Option<String>,
+    date_time: Option<String>,
+}
+
+/// Decode a single IFD located at `ifd_off` (relative to the TIFF header start)
+/// into one field per 12-byte entry, plus a field over any out-of-line value
+/// bytes. `base` is the file offset of `tiff[0]`; `label` distinguishes IFD0
+/// from the ExifIFD in field descriptions. Returns the ExifIFD pointer (tag
+/// 0x8769) if one is present, for the caller to follow.
+///
+/// Every offset here is untrusted: the entry count, each entry, and each
+/// out-of-line value offset are validated against `tiff.len()` before indexing,
+/// so a malformed IFD decodes partially rather than panicking.
+fn decode_ifd(
+    tiff: &[u8],
+    base: usize,
+    ifd_off: usize,
+    le: bool,
+    label: &str,
+    fields: &mut Vec<Field>,
+    summary: &mut ExifSummary,
+) -> Option<usize> {
+    let count = tiff_u16(tiff, ifd_off, le)? as usize;
+    let entries_start = ifd_off + 2;
+    let mut exif_ptr = None;
+
+    for i in 0..count {
+        let entry_off = entries_start + i * 12;
+        // Each entry is 12 bytes; stop if it would run past the payload.
+        if entry_off + 12 > tiff.len() {
+            break;
+        }
+        let tag = tiff_u16(tiff, entry_off, le)?;
+        let typ = tiff_u16(tiff, entry_off + 2, le)?;
+        let cnt = tiff_u32(tiff, entry_off + 4, le)? as usize;
+        let value_slot = entry_off + 8; // 4 bytes: inline value, or an offset
+
+        let byte_count = exif_type_size(typ).saturating_mul(cnt);
+        // The value is inline when it fits in the 4-byte slot, otherwise those
+        // 4 bytes hold an offset (relative to the TIFF header) to the data.
+        let data_off = if byte_count <= 4 {
+            Some(value_slot)
+        } else {
+            let off = tiff_u32(tiff, value_slot, le)? as usize;
+            if off.saturating_add(byte_count) <= tiff.len() {
+                Some(off)
+            } else {
+                None // offset points outside the payload; don't chase it
+            }
+        };
+
+        let value = match data_off {
+            Some(o) => format_exif_value(tiff, o, typ, cnt, le),
+            None => String::new(),
+        };
+
+        let name = exif_tag_name(tag);
+        let field_name = name
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| format!("tag_0x{tag:04X}"));
+        let type_name = exif_type_name(typ);
+        let display_value = if value.is_empty() {
+            format!("({type_name}[{cnt}])")
+        } else {
+            value.clone()
+        };
+
+        // The 12-byte entry itself.
+        fields.push(Field::new(
+            base + entry_off,
+            base + entry_off + 12,
+            field_name.clone(),
+            display_value.clone(),
+            format!(
+                "{label} entry — tag 0x{tag:04X}{}, type {type_name}, count {cnt}.",
+                match name {
+                    Some(n) => format!(" ({n})"),
+                    None => String::new(),
+                }
+            ),
+        ));
+
+        // A field over the out-of-line value bytes, so selecting the data (e.g.
+        // the string a Make/Model points to) also decodes.
+        if byte_count > 4 {
+            if let Some(o) = data_off {
+                fields.push(Field::new(
+                    base + o,
+                    base + o + byte_count,
+                    field_name.clone(),
+                    display_value,
+                    format!("{label} value data for tag 0x{tag:04X} ({type_name}[{cnt}])."),
+                ));
+            }
+        }
+
+        match tag {
+            0x010F => summary.make = Some(value.clone()),
+            0x0110 => summary.model = Some(value.clone()),
+            0x0112 => summary.orientation = Some(value.clone()),
+            0x0132 => summary.date_time = Some(value.clone()),
+            0x8769 => exif_ptr = tiff_u32(tiff, value_slot, le).map(|v| v as usize),
+            _ => {}
+        }
+    }
+
+    exif_ptr
+}
+
+/// Decode an APP1/EXIF payload's TIFF structure into fine-grained fields.
+///
+/// `tiff` is the payload *after* the `"Exif\0\0"` identifier — i.e. it begins
+/// with the TIFF header — and `base` is the file offset of that first byte. All
+/// TIFF offsets are relative to this header start. Decodes the header, IFD0, and
+/// the ExifIFD it points to (tag 0x8769); IFD-following is capped at that one
+/// pointer so a malformed or self-referential offset cannot loop. Returns the
+/// headline values for the summary.
+fn decode_exif(tiff: &[u8], base: usize, fields: &mut Vec<Field>) -> ExifSummary {
+    let mut summary = ExifSummary::default();
+    // TIFF header is 8 bytes: byte-order (2) + magic (2) + IFD0 offset (4).
+    if tiff.len() < 8 {
+        return summary;
+    }
+    let le = match &tiff[0..2] {
+        b"II" => true,
+        b"MM" => false,
+        _ => return summary, // not a TIFF byte-order mark
+    };
+    fields.push(Field::new(
+        base,
+        base + 2,
+        "tiff_byte_order",
+        if le {
+            "little-endian (II)"
+        } else {
+            "big-endian (MM)"
+        },
+        "TIFF byte order: \"II\" = little-endian (Intel), \"MM\" = big-endian (Motorola). All TIFF values use this order.",
+    ));
+    // Magic and IFD0 offset are guaranteed in-range by the length check above.
+    let magic = tiff_u16(tiff, 2, le).unwrap_or(0);
+    fields.push(Field::new(
+        base + 2,
+        base + 4,
+        "tiff_magic",
+        format!("{magic}"),
+        "TIFF magic number, always 42 (0x002A).",
+    ));
+    let ifd0_off = tiff_u32(tiff, 4, le).unwrap_or(0) as usize;
+    fields.push(Field::new(
+        base + 4,
+        base + 8,
+        "ifd0_offset",
+        format!("{ifd0_off}"),
+        "Offset from the TIFF header start to the first IFD (IFD0).",
+    ));
+
+    let exif_ptr = decode_ifd(tiff, base, ifd0_off, le, "IFD0", fields, &mut summary);
+    // Follow the ExifIFD pointer exactly once, and never back onto IFD0, so a
+    // self-referential pointer cannot cause a loop or duplicate fields.
+    if let Some(ptr) = exif_ptr {
+        if ptr != ifd0_off {
+            decode_ifd(tiff, base, ptr, le, "ExifIFD", fields, &mut summary);
+        }
+    }
+    summary
+}
+
 /// Does this marker stand alone (no length + payload)? SOI/EOI/TEM/RSTn do.
 fn is_standalone(marker: u8) -> bool {
     matches!(marker, 0xD8 | 0xD9 | 0x01) || (0xD0..=0xD7).contains(&marker)
@@ -279,6 +583,7 @@ impl ImageFormat for JpegFormat {
         let mut sof_desc: Option<&'static str> = None;
         let mut jfif_version: Option<String> = None;
         let mut has_exif = false;
+        let mut exif: Option<ExifSummary> = None;
         let mut comment: Option<String> = None;
         let mut quant_tables = 0usize;
         let mut huff_tables: Vec<(u8, u8)> = Vec::new();
@@ -464,6 +769,9 @@ impl ImageFormat for JpegFormat {
                     "Exif",
                     "EXIF APP1 identifier (the bytes \"Exif\\0\\0\").",
                 ));
+                // Deep-parse the TIFF/IFD structure that follows the identifier.
+                // The TIFF header starts at the byte after "Exif\0\0".
+                exif = Some(decode_exif(&payload[6..], payload_start + 6, &mut fields));
             } else if marker == 0xFE {
                 let text = String::from_utf8_lossy(payload).into_owned();
                 if payload_start < seg_end {
@@ -570,6 +878,26 @@ impl ImageFormat for JpegFormat {
             "EXIF metadata".into(),
             if has_exif { "present" } else { "absent" }.into(),
         ));
+        if let Some(ex) = &exif {
+            // Surface the headline camera tags when present and non-empty.
+            for (label, v) in [("Camera make", &ex.make), ("Camera model", &ex.model)] {
+                if let Some(val) = v {
+                    if !val.is_empty() {
+                        summary.push((label.into(), val.clone()));
+                    }
+                }
+            }
+            if let Some(o) = &ex.orientation {
+                if !o.is_empty() {
+                    summary.push(("Orientation".into(), describe_orientation(o)));
+                }
+            }
+            if let Some(dt) = &ex.date_time {
+                if !dt.is_empty() {
+                    summary.push(("DateTime".into(), dt.clone()));
+                }
+            }
+        }
         if let Some(c) = comment {
             summary.push(("Comment".into(), c));
         }

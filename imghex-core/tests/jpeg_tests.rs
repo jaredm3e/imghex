@@ -289,6 +289,159 @@ fn dht_decodes_multiple_tables_and_symbols() {
 }
 
 #[test]
+fn exif_tiff_header_and_ifd0_tags_are_decoded() {
+    let jpg = fixtures::jpeg_exif_le();
+    let img = parse_auto(&jpg).unwrap();
+
+    // The TIFF header begins at file offset 12 (see `jpeg_exif_le`).
+    let base = 12;
+
+    // Byte-order, magic, IFD0 offset each become fields.
+    let bo = img
+        .fields
+        .iter()
+        .find(|f| f.name == "tiff_byte_order")
+        .expect("byte-order field");
+    assert_eq!(bo.start, base);
+    assert!(bo.value.contains("little-endian"));
+    let magic = img.fields.iter().find(|f| f.name == "tiff_magic").unwrap();
+    assert_eq!(magic.value, "42");
+    let ifd0 = img.fields.iter().find(|f| f.name == "ifd0_offset").unwrap();
+    assert_eq!(ifd0.value, "8");
+
+    // Make: an ASCII tag whose data is out-of-line. The 12-byte entry sits at
+    // TIFF offset 10 (base + 10), decoding to "imghex".
+    let make = img
+        .fields
+        .iter()
+        .find(|f| f.name == "Make" && f.len() == 12)
+        .expect("Make entry field");
+    assert_eq!(make.value, "imghex");
+    assert_eq!(make.start, base + 10);
+
+    // The out-of-line string bytes (TIFF offset 62) also decode when selected.
+    let make_data = img
+        .fields
+        .iter()
+        .find(|f| f.name == "Make" && f.start == base + 62)
+        .expect("Make value-data field");
+    assert_eq!(make_data.value, "imghex");
+    assert_eq!(make_data.len(), 7);
+
+    // Orientation: an inline SHORT.
+    let orient = img.fields.iter().find(|f| f.name == "Orientation").unwrap();
+    assert_eq!(orient.value, "1");
+
+    // DateTime: out-of-line ASCII.
+    let dt = img
+        .fields
+        .iter()
+        .find(|f| f.name == "DateTime" && f.len() == 12)
+        .unwrap();
+    assert_eq!(dt.value, "2026:07:14 12:00:00");
+}
+
+#[test]
+fn exif_ifd_pointer_is_followed() {
+    let jpg = fixtures::jpeg_exif_le();
+    let img = parse_auto(&jpg).unwrap();
+
+    // The ExifIFD (tag 0x8769) pointer is followed; its tags appear as fields.
+    let exposure = img
+        .fields
+        .iter()
+        .find(|f| f.name == "ExposureTime")
+        .expect("ExposureTime from the ExifIFD");
+    assert_eq!(exposure.value, "1/100");
+
+    let iso = img
+        .fields
+        .iter()
+        .find(|f| f.name == "ISOSpeedRatings")
+        .expect("ISO from the ExifIFD");
+    assert_eq!(iso.value, "400");
+}
+
+#[test]
+fn exif_headline_tags_appear_in_summary() {
+    let jpg = fixtures::jpeg_exif_le();
+    let img = parse_auto(&jpg).unwrap();
+
+    assert!(img
+        .summary
+        .iter()
+        .any(|(k, v)| k == "EXIF metadata" && v == "present"));
+    assert!(img
+        .summary
+        .iter()
+        .any(|(k, v)| k == "Camera make" && v == "imghex"));
+    assert!(img
+        .summary
+        .iter()
+        .any(|(k, v)| k == "Orientation" && v == "1 (normal)"));
+    assert!(img
+        .summary
+        .iter()
+        .any(|(k, v)| k == "DateTime" && v == "2026:07:14 12:00:00"));
+}
+
+#[test]
+fn exif_selecting_ifd_bytes_decodes_them() {
+    // The display requirement: selecting an offset inside the Make entry returns
+    // the decoded field via `field_at`.
+    let jpg = fixtures::jpeg_exif_le();
+    let img = parse_auto(&jpg).unwrap();
+    let base = 12;
+    let f = img.field_at(base + 10).expect("a field at the Make entry");
+    assert_eq!(f.name, "Make");
+    assert_eq!(f.value, "imghex");
+}
+
+#[test]
+fn exif_big_endian_is_decoded() {
+    let jpg = fixtures::jpeg_exif_be();
+    let img = parse_auto(&jpg).unwrap();
+
+    let bo = img
+        .fields
+        .iter()
+        .find(|f| f.name == "tiff_byte_order")
+        .unwrap();
+    assert!(bo.value.contains("big-endian"));
+    let make = img
+        .fields
+        .iter()
+        .find(|f| f.name == "Make" && f.len() == 12)
+        .unwrap();
+    assert_eq!(make.value, "imghex");
+    // Orientation 6 → rotated 90° CW in the summary.
+    assert!(img
+        .summary
+        .iter()
+        .any(|(k, v)| k == "Orientation" && v == "6 (rotated 90° CW)"));
+}
+
+#[test]
+fn exif_bogus_ifd_offset_does_not_panic() {
+    // A TIFF header pointing IFD0 far past the payload must decode the header
+    // only, emit no tag fields, and neither panic nor loop.
+    let jpg = fixtures::jpeg_exif_bad_offset();
+    let img = parse_auto(&jpg).unwrap();
+
+    assert!(img
+        .summary
+        .iter()
+        .any(|(k, v)| k == "EXIF metadata" && v == "present"));
+    // Header fields exist, but no Make/Model/Orientation were decodable.
+    assert!(img.fields.iter().any(|f| f.name == "tiff_byte_order"));
+    assert!(!img.fields.iter().any(|f| f.name == "Make"));
+    assert!(!img
+        .summary
+        .iter()
+        .any(|(k, _)| k == "Camera make" || k == "Orientation"));
+}
+
+#[test]
 fn truncated_after_soi_does_not_panic() {
     // Just the SOI marker, nothing else.
     let img = parse_auto(&[0xFF, 0xD8]).unwrap();
