@@ -98,6 +98,75 @@ fn decode_dqt(payload: &[u8], base: usize, fields: &mut Vec<Field>) -> usize {
     tables
 }
 
+/// Decode a DHT (Define Huffman Table) payload into fine-grained fields.
+///
+/// The payload holds one or more tables back to back. Each is a `Tc<<4 | Th`
+/// header byte — high nibble `Tc` is the table class (0 = DC / lossless, 1 =
+/// AC), low nibble `Th` is the table id (0–3) — followed by 16 bytes giving the
+/// number of Huffman codes of each length 1..16, then `sum(counts)` symbol
+/// bytes (the values those codes map to, in order of increasing code length).
+/// `base` is the file offset of the first payload byte. Returns the `(class,
+/// id)` of every complete table decoded (for the summary). A truncated trailing
+/// table is decoded as far as the payload allows and not returned.
+fn decode_dht(payload: &[u8], base: usize, fields: &mut Vec<Field>) -> Vec<(u8, u8)> {
+    let mut i = 0usize;
+    let mut tables = Vec::new();
+    while i < payload.len() {
+        let tc_th = payload[i];
+        let class = tc_th >> 4; // 0 = DC (or lossless), 1 = AC
+        let table_id = tc_th & 0x0F;
+        let class_name = match class {
+            0 => "DC",
+            1 => "AC",
+            _ => "?",
+        };
+        let header_off = base + i;
+        fields.push(Field::new(
+            header_off,
+            header_off + 1,
+            "huff_table",
+            format!("{class_name} table {table_id}"),
+            "Huffman table header: high nibble is the table class (0 = DC, 1 = AC), low nibble is the table id (0–3).",
+        ));
+        i += 1;
+        // 16 code-length counts: counts[n] = number of codes of length n+1.
+        if i + 16 > payload.len() {
+            // Truncated before the full count list: stop without counting it.
+            return tables;
+        }
+        let counts = &payload[i..i + 16];
+        let total: usize = counts.iter().map(|&c| c as usize).sum();
+        fields.push(Field::new(
+            base + i,
+            base + i + 16,
+            "code_counts",
+            format!("{total} symbols"),
+            "Sixteen bytes giving the number of Huffman codes of each length 1..16; they sum to the number of symbols that follow.",
+        ));
+        i += 16;
+        // `total` symbol bytes, one field each, in order of increasing code
+        // length. The value each Huffman code decodes to.
+        for k in 0..total {
+            if i >= payload.len() {
+                // Truncated symbol list: stop without counting this table.
+                return tables;
+            }
+            let start = base + i;
+            let symbol = payload[i];
+            fields.push(Field::new(
+                start,
+                start + 1,
+                format!("symbol[{k}]"),
+                format!("0x{symbol:02X}"),
+                format!("Symbol #{k} in the Huffman table (the value this code maps to)."),
+            ));
+            i += 1;
+        }
+        tables.push((class, table_id));
+    }
+    tables
+}
+
 /// Does this marker stand alone (no length + payload)? SOI/EOI/TEM/RSTn do.
 fn is_standalone(marker: u8) -> bool {
     matches!(marker, 0xD8 | 0xD9 | 0x01) || (0xD0..=0xD7).contains(&marker)
@@ -212,6 +281,7 @@ impl ImageFormat for JpegFormat {
         let mut has_exif = false;
         let mut comment: Option<String> = None;
         let mut quant_tables = 0usize;
+        let mut huff_tables: Vec<(u8, u8)> = Vec::new();
         let mut segment_count = 0usize;
 
         let mut pos = 0usize;
@@ -417,6 +487,8 @@ impl ImageFormat for JpegFormat {
                 ));
             } else if marker == 0xDB {
                 quant_tables += decode_dqt(payload, payload_start, &mut fields);
+            } else if marker == 0xC4 {
+                huff_tables.extend(decode_dht(payload, payload_start, &mut fields));
             }
 
             if marker == 0xDA {
@@ -467,6 +539,29 @@ impl ImageFormat for JpegFormat {
         }
         if quant_tables > 0 {
             summary.push(("Quantization tables".into(), format!("{quant_tables}")));
+        }
+        if !huff_tables.is_empty() {
+            // List the defined tables by class, e.g. "DC: 0, 1 · AC: 0, 1".
+            let ids = |class: u8| {
+                huff_tables
+                    .iter()
+                    .filter(|&&(c, _)| c == class)
+                    .map(|&(_, id)| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let mut parts = Vec::new();
+            let dc = ids(0);
+            if !dc.is_empty() {
+                parts.push(format!("DC: {dc}"));
+            }
+            let ac = ids(1);
+            if !ac.is_empty() {
+                parts.push(format!("AC: {ac}"));
+            }
+            if !parts.is_empty() {
+                summary.push(("Huffman tables".into(), parts.join(" · ")));
+            }
         }
         if let Some(v) = jfif_version {
             summary.push(("JFIF version".into(), v));

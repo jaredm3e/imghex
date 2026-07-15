@@ -334,3 +334,28 @@ pub fn jpeg_dual_dqt() -> Vec<u8> {
     out.extend_from_slice(&[0xFF, 0xD9]); // EOI
     out
 }
+
+/// Build a minimal JPEG (SOI, one DHT, EOI) whose single DHT segment defines two
+/// Huffman tables back to back: a DC table (id 0) with 3 symbols, and an AC
+/// table (id 0) with 3 symbols — exercising multi-table decoding and the
+/// symbol-count math (counts summing to the length of the symbol list).
+pub fn jpeg_dual_dht() -> Vec<u8> {
+    let mut dht = Vec::new();
+    // DC table 0: Tc = 0 (DC), Th = 0. Counts say 1 code of length 2 and 2 codes
+    // of length 3, so 3 symbols follow.
+    dht.push(0x00);
+    let dc_counts = [0u8, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    dht.extend_from_slice(&dc_counts);
+    dht.extend_from_slice(&[0x01, 0x02, 0x03]);
+    // AC table 0: Tc = 1 (AC), Th = 0. Counts say 2 codes of length 2 and 1 of
+    // length 3, so 3 symbols follow.
+    dht.push(0x10);
+    let ac_counts = [0u8, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    dht.extend_from_slice(&ac_counts);
+    dht.extend_from_slice(&[0x11, 0x12, 0x21]);
+    let mut out = Vec::new();
+    out.extend_from_slice(&[0xFF, 0xD8]); // SOI
+    push_jpeg_segment(&mut out, 0xC4, &dht);
+    out.extend_from_slice(&[0xFF, 0xD9]); // EOI
+    out
+}
