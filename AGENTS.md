@@ -22,6 +22,9 @@ cd ../imghex-<issue-number>
   active — which is the normal case here. Two agents editing the same working
   tree will clobber each other. A worktree gives you your own files while sharing
   the one `.git`.
+- **Stay inside your worktree.** Only edit files under your own worktree path;
+  never touch the primary checkout, and leave `main` clean. A stray edit there
+  corrupts the tree other agents share (watch for symlinks pointing back to it).
 - **Branch naming:** short and descriptive, e.g. `jpeg-dqt-fields`,
   `hex-edit-overwrite`. One branch per issue.
 - When the branch is merged, clean up: `git worktree remove ../imghex-<issue>`.
@@ -96,8 +99,10 @@ findings fixed. Who performs the merge depends on what the change touches:
 - **Keep `imghex-core` a pure decoder** — no GUI dependencies, no I/O. Parsers
   are `fn parse(&[u8]) -> Result<ParsedImage, _>`. GUI/editing/state lives in
   `imghex-gui`.
-- **Match the surrounding code** — naming, comment density, and idioms. Read the
-  neighboring format parser before adding a new one.
+- **Match the surrounding code — mirror the nearest sibling.** When extending an
+  existing area, copy the closest existing pattern (e.g. a new JPEG segment
+  decoder mirrors `decode_dqt`); match naming, comment density, and idioms. Read
+  the neighboring code before writing.
 - Adding a new format is one trait impl in `imghex-core/src/formats/` plus one
   line in `format::registry()`. See `README.md` for the architecture tour.
 
