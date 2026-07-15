@@ -199,6 +199,96 @@ fn dqt_decodes_multiple_tables_and_16bit_precision() {
 }
 
 #[test]
+fn dht_degenerate_table_is_decoded() {
+    let jpg = fixtures::jpeg_baseline(16, 16);
+    let img = parse_auto(&jpg).unwrap();
+
+    // The baseline fixture's DHT is a single DC table (id 0) with all-zero
+    // counts and therefore no symbols. The class/id byte is its own field...
+    let header = img
+        .fields
+        .iter()
+        .find(|f| f.name == "huff_table")
+        .expect("huffman table header field");
+    assert_eq!(header.value, "DC table 0");
+    assert_eq!(header.len(), 1);
+
+    // ...the 16 counts collapse to a single field reporting the symbol total...
+    let counts = img
+        .fields
+        .iter()
+        .find(|f| f.name == "code_counts")
+        .expect("code counts field");
+    assert_eq!(counts.value, "0 symbols");
+    assert_eq!(counts.len(), 16);
+    assert_eq!(counts.start, header.end);
+
+    // ...and with no symbols there are no symbol fields.
+    assert!(!img.fields.iter().any(|f| f.name.starts_with("symbol[")));
+
+    // Summary lists the one DC table.
+    assert!(img
+        .summary
+        .iter()
+        .any(|(k, v)| k == "Huffman tables" && v == "DC: 0"));
+}
+
+#[test]
+fn dht_decodes_multiple_tables_and_symbols() {
+    let jpg = fixtures::jpeg_dual_dht();
+    let img = parse_auto(&jpg).unwrap();
+
+    // Two table headers (a DC and an AC), each with 3 symbols → 6 symbol fields.
+    let headers: Vec<_> = img
+        .fields
+        .iter()
+        .filter(|f| f.name == "huff_table")
+        .collect();
+    assert_eq!(headers.len(), 2);
+    let symbols: Vec<_> = img
+        .fields
+        .iter()
+        .filter(|f| f.name.starts_with("symbol["))
+        .collect();
+    assert_eq!(symbols.len(), 6);
+
+    // Payload begins at offset 6 (SOI=2, FF C4 + 2-byte length = 4). Table 0's
+    // header sits there; its 16 counts occupy 7..23; its 3 symbols 23..26; so
+    // the AC table's header falls at offset 26.
+    let dc = img
+        .fields
+        .iter()
+        .find(|f| f.start == 6 && f.name == "huff_table")
+        .unwrap();
+    assert_eq!(dc.value, "DC table 0");
+    let dc_counts = img.fields.iter().find(|f| f.start == 7).unwrap();
+    assert_eq!(dc_counts.name, "code_counts");
+    assert_eq!(dc_counts.value, "3 symbols");
+
+    let ac = img
+        .fields
+        .iter()
+        .find(|f| f.start == 26 && f.name == "huff_table")
+        .unwrap();
+    assert_eq!(ac.value, "AC table 0");
+    let ac_counts = img.fields.iter().find(|f| f.start == 27).unwrap();
+    assert_eq!(ac_counts.name, "code_counts");
+    assert_eq!(ac_counts.value, "3 symbols");
+
+    // The AC table's symbols start immediately after its counts, at offset 43.
+    let ac_sym0 = img.fields.iter().find(|f| f.start == 43).unwrap();
+    assert_eq!(ac_sym0.name, "symbol[0]");
+    assert_eq!(ac_sym0.value, "0x11");
+    assert_eq!(ac_sym0.len(), 1);
+
+    // Summary lists both classes.
+    assert!(img
+        .summary
+        .iter()
+        .any(|(k, v)| k == "Huffman tables" && v == "DC: 0 · AC: 0"));
+}
+
+#[test]
 fn truncated_after_soi_does_not_panic() {
     // Just the SOI marker, nothing else.
     let img = parse_auto(&[0xFF, 0xD8]).unwrap();
